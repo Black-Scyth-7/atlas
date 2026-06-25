@@ -32,3 +32,5 @@ faces.npz
 
 # Wake-word training artifacts (~18GB: clips, 17GB negatives, features)
 wake_training/
+
+.vscode/
