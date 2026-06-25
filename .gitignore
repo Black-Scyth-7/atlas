@@ -1,0 +1,34 @@
+# Secrets — never commit
+.env
+
+# Local enrollment data
+voiceprint.npy
+
+# Models (large; download per README)
+models/
+pretrained/
+
+# Embedded Qdrant stores (memory + documents)
+qdrant_data/
+qdrant_docs/
+
+# Your personal documents for RAG
+docs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Scratch audio
+*.wav
+
+# Screenshots + webcam photos captured via system control
+screenshots/
+photos/
+
+# Enrolled face embeddings (biometric data — keep local)
+faces.npz
+
+# Wake-word training artifacts (~18GB: clips, 17GB negatives, features)
+wake_training/

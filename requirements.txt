@@ -1,0 +1,60 @@
+# Atlas — local voice assistant. Target interpreter: CPython 3.12.x.
+# The heavy ML deps (torch, ctranslate2, llama-cpp-python, onnxruntime) do not
+# yet ship wheels for 3.13/3.14, so install everything into a 3.12 venv:
+#     py -3.12 -m venv .venv
+#     .venv\Scripts\activate
+#     pip install -r requirements.txt
+
+# --- Audio I/O ---
+sounddevice
+numpy>=1.26          # first NumPy with cp312 wheels
+
+# --- Wake word (openWakeWord) ---
+openwakeword
+onnxruntime          # inference backend for openWakeWord on Windows
+
+# --- Voice activity detection ---
+# Use the -wheels fork: upstream `webrtcvad` has no cp312 wheels and fails to
+# build on Windows. This is a drop-in replacement; code still does `import webrtcvad`.
+webrtcvad-wheels
+
+# --- Speech-to-text ---
+faster-whisper
+
+# --- Speaker verification (SpeechBrain ECAPA-TDNN) ---
+speechbrain
+torch
+torchaudio
+
+# --- LLM brain ---
+# Plain install = CPU-only (ignores n_gpu_layers). For GPU offload you must
+# build from source against CUDA and run setup_gpu.py — see README "GPU build".
+llama-cpp-python
+
+# --- Text-to-speech ---
+piper-tts>=1.2.0     # 1.2+ provides cp312 wheels (incl. piper-phonemize)
+
+# --- Tools ---
+mcp                  # web_search via the Tavily MCP server (optional; falls
+                     # back to DuckDuckGo if ATLAS_TAVILY_MCP_URL is unset)
+python-dotenv        # load credentials from a local .env in any shell
+
+# --- Persistent memory ---
+qdrant-client        # embedded vector store (in-process, on-disk; no daemon)
+fastembed            # CPU text embeddings (BAAI/bge-small-en-v1.5, 384-d)
+
+# --- Durable agent state ---
+psycopg[binary]      # PostgreSQL driver (conversation log + user profile)
+
+# --- Cache ---
+redis                # cache client (Memurai on Windows speaks the Redis protocol)
+
+# --- RAG over documents ---
+pypdf                # extract text from PDFs for ingest.py
+
+# --- System control (Windows) ---
+pycaw                     # system + per-app volume/mute
+screen-brightness-control # display brightness (screenshots use Pillow, already a dep)
+winsdk                    # media session control + now-playing (Windows SMTC)
+opencv-python             # webcam capture for see_camera / take_photo
+insightface               # face recognition (ArcFace embeddings, ONNX/CPU)
