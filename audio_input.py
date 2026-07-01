@@ -11,6 +11,7 @@ saves it to command.wav so you can play it back.
 
 import wave
 from collections import deque
+from typing import Protocol, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -19,6 +20,11 @@ import openwakeword
 from openwakeword.model import Model
 
 from config import Config
+
+
+class MicLike(Protocol):
+    """A readable mic stream — the raw sd.InputStream or a DSP wrapper of it."""
+    def read(self, frames: int) -> Tuple[np.ndarray, bool]: ...
 
 
 def open_stream(cfg: Config) -> sd.InputStream:
@@ -38,28 +44,54 @@ def load_wake_model(cfg: Config) -> Model:
     # Idempotent: fetches the melspectrogram/embedding base models and the
     # bundled pretrained wake words on first run, then no-ops. Needs internet
     # the first time only.
-    openwakeword.utils.download_models()
+    openwakeword.utils.download_models() # type: ignore
     return Model(
         wakeword_models=[cfg.wake_model],
         inference_framework=cfg.wake_framework,
     )
 
 
-def wait_for_wake_word(stream: sd.InputStream, oww: Model, cfg: Config) -> None:
-    """Block until openWakeWord's score crosses the threshold."""
+def wait_for_wake_word(stream: MicLike, oww: Model, cfg: Config,
+                       interrupt=None) -> bool:
+    """Block until the wake word is detected. Returns True when it is.
+
+    If `interrupt` (a threading.Event) is given and gets set — e.g. the user
+    pressed the text-input key — this returns False instead, so the caller can
+    switch to typed input.
+
+    Reads RAW (un-denoised) audio: the wake-word model is trained on raw mic
+    audio, and noise suppression shifts the signal enough to hurt detection.
+    Noise suppression is applied only to the recorded command (read()).
+    """
+    read = getattr(stream, "read_raw", None) or stream.read
     buf = np.empty(0, dtype=np.int16)
+    warmup = max(0, getattr(cfg, "wake_warmup_chunks", 0))
+    need = max(1, getattr(cfg, "wake_consecutive", 1))
+    oww.reset()
+    seen = 0    # chunks scored since reset (to skip the warm-up spike window)
+    run = 0     # consecutive chunks currently over threshold
     while True:
-        frame, _ = stream.read(cfg.frame_samples)
+        if interrupt is not None and interrupt.is_set():
+            return False
+        frame, _ = read(cfg.frame_samples)
         buf = np.concatenate([buf, frame[:, 0]])
         while len(buf) >= cfg.wake_chunk:
             chunk, buf = buf[: cfg.wake_chunk], buf[cfg.wake_chunk:]
             scores = oww.predict(np.ascontiguousarray(chunk))
-            if max(scores.values()) >= cfg.wake_threshold:
-                oww.reset()
-                return
+            seen += 1
+            if seen <= warmup:      # let the buffers fill; ignore early spikes
+                run = 0
+                continue
+            if max(scores.values()) >= cfg.wake_threshold:  # type: ignore
+                run += 1
+                if run >= need:
+                    oww.reset()
+                    return True
+            else:
+                run = 0
 
 
-def record_until_silence(stream: sd.InputStream, vad: webrtcvad.Vad,
+def record_until_silence(stream: MicLike, vad: webrtcvad.Vad,
                          cfg: Config,
                          start_timeout_ms: int | None = None) -> np.ndarray:
     """Record a command until silence_tail_ms of trailing quiet. Returns float32.
@@ -105,7 +137,7 @@ def record_until_silence(stream: sd.InputStream, vad: webrtcvad.Vad,
     return audio_int16.astype(np.float32) / 32768.0
 
 
-def record_fixed(stream: sd.InputStream, seconds: float, cfg: Config) -> np.ndarray:
+def record_fixed(stream: MicLike, seconds: float, cfg: Config) -> np.ndarray:
     """Record a fixed duration (used for enrollment). Returns float32."""
     frames = int(seconds * 1000 / cfg.frame_ms)
     chunks = [stream.read(cfg.frame_samples)[0][:, 0] for _ in range(frames)]

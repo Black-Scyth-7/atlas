@@ -30,6 +30,7 @@ torchaudio
 # Plain install = CPU-only (ignores n_gpu_layers). For GPU offload you must
 # build from source against CUDA and run setup_gpu.py — see README "GPU build".
 llama-cpp-python
+json_repair          # repair slightly-malformed JSON tool calls from the model
 
 # --- Text-to-speech ---
 piper-tts>=1.2.0     # 1.2+ provides cp312 wheels (incl. piper-phonemize)
@@ -56,5 +57,6 @@ pypdf                # extract text from PDFs for ingest.py
 pycaw                     # system + per-app volume/mute
 screen-brightness-control # display brightness (screenshots use Pillow, already a dep)
 winsdk                    # media session control + now-playing (Windows SMTC)
+pyrnnoise                 # RNNoise noise suppression (bundled DLL; see audio_dsp.py)
 opencv-python             # webcam capture for see_camera / take_photo
 insightface               # face recognition (ArcFace embeddings, ONNX/CPU)

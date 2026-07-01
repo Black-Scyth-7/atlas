@@ -1,0 +1,5 @@
+# Isolated environment for the CrewAI coding agent (.venv-crew).
+# Kept SEPARATE from Atlas's requirements.txt on purpose: CrewAI's deps would
+# downgrade protobuf/pydantic and can break onnxruntime (wake word, vision,
+# faces) and qdrant (memory) in Atlas's main venv. Install with setup_crew.py.
+crewai[google-genai]

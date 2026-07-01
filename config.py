@@ -33,6 +33,13 @@ class Config:
     wake_model: str = "models/atlas.onnx"
     wake_framework: str = "onnx"    # "onnx" (reliable on Windows) or "tflite"
     wake_threshold: float = 0.5     # raise to reduce false triggers
+    # The model's internal buffers fill over the first ~1 s after a reset and can
+    # spike spuriously (e.g. it scores 0.77 on pure silence); ignore detections
+    # during this warm-up of 80 ms chunks so Atlas doesn't wake itself at startup.
+    wake_warmup_chunks: int = 12
+    # Require this many CONSECUTIVE over-threshold chunks to fire. A real "atlas"
+    # spans several chunks; a lone spike from silence/transient noise doesn't.
+    wake_consecutive: int = 2
 
     # --- Recording / voice activity detection (webrtcvad) ---
     silence_tail_ms: int = 800      # stop after this much trailing silence
@@ -46,6 +53,22 @@ class Config:
     # waiting for the wake word.
     enable_followup: bool = True
     followup_window_ms: int = 6000  # how long to wait for a follow-up to begin
+
+    # --- Text input (secondary input) ---
+    # Press this key (default F1) at any time to type a command instead of
+    # speaking it; the typed text runs through the same LLM/response pipeline.
+    # Windows-only (uses GetAsyncKeyState). Set enable_text_input False to skip.
+    enable_text_input: bool = True
+    text_input_vk: int = 0x70       # virtual-key code (0x70 = F1)
+
+    # --- Startup phrase ---
+    # Spoken aloud once Atlas finishes loading and is ready. "" = silent start.
+    startup_phrase: str = "Atlas is online and ready."
+
+    # --- "Didn't get it" phrase ---
+    # Spoken when Atlas wakes but hears nothing / can't transcribe the command,
+    # so you get feedback instead of silence. "" = stay silent.
+    not_understood_phrase: str = "Sorry, I didn't catch that."
 
     # --- Speaker verification (SpeechBrain ECAPA-TDNN, CPU) ---
     # NOTE: this gate is PERSONALIZATION, not security. It only checks whether a
@@ -77,7 +100,7 @@ class LLMConfig:
     # resident the whole session.
     model_path: str = "models/Qwen3-8B-Q4_K_M.gguf"
     n_gpu_layers: int = -1          # -1 = offload all layers to GPU
-    n_ctx: int = 4096
+    n_ctx: int = 8192
     max_tokens: int = 512
     temperature: float = 0.7
     keep_turns: int = 8             # rolling history: system prompt + last N turns
@@ -137,6 +160,16 @@ class ToolsConfig:
     # long a run_command may take (seconds).
     enable_coding: bool = True
     command_timeout: int = 60
+
+    # Self-extension: let Atlas write new tools/functions of its own and load
+    # them permanently. Each new tool is a file in plugins_dir, auto-loaded at
+    # startup and registered live when created. create_tool/remove_tool are
+    # gated by spoken confirmation (they add/remove code that runs in-process).
+    enable_self_extend: bool = True
+    plugins_dir: str = "plugins"
+    # Auto-install third-party packages a created tool declares (`# pip: ...`)
+    # into Atlas's venv so the new tool works immediately.
+    auto_install_tool_deps: bool = True
 
     # Tavily credentials, read from the environment (the MCP URL embeds the key,
     # so it doubles as a key source for the REST backend):
@@ -261,11 +294,49 @@ class AuthConfig:
     here to disable the gate.
     """
     require_identity: bool = True
+    # Test mode: skip ALL startup auth (no face, voice, or password) and the
+    # per-turn speaker gate, for frictionless development. Toggled in .env via
+    # ATLAS_TEST_MODE; default disabled (the gate is on).
+    test_mode: bool = field(default_factory=lambda: os.environ.get(
+        "ATLAS_TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on"))
     owner_name: str = "owner"        # name the owner's face is enrolled under
     face_shots: int = 5              # face samples captured during onboarding
     voice_samples: int = 5           # voice phrases recorded during onboarding
     voice_seconds: float = 4.0       # seconds recorded per onboarding phrase
     auth_attempts: int = 3           # verification tries before Atlas refuses to start
+    # Typed password — a real "something you know" factor (not spoofable like
+    # face/voice). Set on first run, then required (with face + voice) every
+    # startup. Stored only as a salted PBKDF2 hash in password_path.
+    require_password: bool = True
+    password_path: str = "auth_secret.dat"
+    # Registry of registered people and their authority (role). At registration
+    # Atlas asks for a NAME and an AUTHORITY; the single 'admin' is unique.
+    # owner_name above is only the fallback used before anyone is registered —
+    # the real name/role come from this file (see auth.onboard / auth.register).
+    users_path: str = "users.json"
+    authorities: tuple = ("admin", "user", "guest")
+
+
+@dataclass
+class DspConfig:
+    """Mic-side audio DSP: RNNoise noise suppression + acoustic echo
+    cancellation (see audio_dsp.py). Both are best-effort — if a backend can't
+    load, that stage passes audio through unchanged."""
+
+    # Noise suppression (RNNoise) on the captured mic audio — helps the wake
+    # word, VAD, and STT work in a noisy room.
+    enable_noise_suppression: bool = True
+
+    # Acoustic echo cancellation during playback, so Atlas's own voice coming
+    # out of the speakers doesn't false-trigger the wake word (barge-in without
+    # headphones). Frequency-domain (partitioned) NLMS adaptive filter.
+    enable_echo_cancellation: bool = True
+    aec_block: int = 160          # samples @16k per AEC block (10 ms)
+    aec_filter_blocks: int = 16   # filter length = block*this (~160 ms of echo)
+    aec_mu: float = 0.5           # NLMS adaptation step (0..1)
+    # Extra bulk delay (ms) to align the playback reference with the mic; tune
+    # up if echo isn't being removed (system output+input latency varies).
+    aec_ref_delay_ms: int = 0
 
 
 @dataclass
@@ -289,9 +360,21 @@ class AgentsConfig:
     confirm_risky: bool = True
     # Tools that always need confirmation. system_power and write_file are
     # handled specially (only shutdown/restart, and only overwrites, need it).
-    risky_tools: list = field(
-        default_factory=lambda: ["close_app", "create_github_repo",
-                                 "run_command", "debug_python", "reset_all"])
+    # Spoken confirmation is reserved for the few genuinely destructive actions:
+    # powering off the PC, overwriting a file, and deleting files. Those are
+    # handled explicitly in Orchestrator._needs_confirm; this list is the
+    # catch-all for any OTHER tool that should also ask first (empty by default
+    # so normal commands run without a yes/no).
+    risky_tools: list = field(default_factory=list)
+    # Tools only the ADMIN may run (login authority). Non-admins (user/guest)
+    # get a refusal; ignored entirely in test mode (everything unrestricted).
+    # Names that don't exist are harmless — they simply never match.
+    admin_only_tools: list = field(
+        default_factory=lambda: [
+            "run_command", "debug_python", "reset_all", "create_tool",
+            "remove_tool", "create_github_repo", "close_app", "open_app",
+            "write_file", "edit_file", "register_user", "shutdown",
+            "restart_system", "control_app", "open_website"])
 
     react_system_prompt: str = (
         "You are Atlas, a capable voice assistant that completes tasks by using "
@@ -301,6 +384,65 @@ class AgentsConfig:
         "finish. When the task is complete, reply in plain text (no JSON) with one "
         "short sentence for the user (it is spoken aloud). Use the fewest steps "
         "needed. ALWAYS perform actions by calling the matching tool — never claim "
-        "you did something without calling its tool. If a tool fails, adapt or "
-        "briefly say why. If no tool is needed, just answer directly."
+        "you did something without calling its tool. You CANNOT change the system "
+        "(volume, brightness, apps, mouse, keyboard, media, screenshots, power) by "
+        "saying you did — you MUST emit the tool JSON, and may only confirm AFTER "
+        "the Observation, reporting only what it says. Examples: 'turn up the "
+        'volume\' -> {"tool":"set_volume","arguments":{"percent":70}}; \'open '
+        'notepad\' -> {"tool":"open_app","arguments":{"name":"notepad"}}; \'take a '
+        'screenshot\' -> {"tool":"take_screenshot","arguments":{}}. '
+        "If a tool's Observation shows "
+        "it failed or returned an error, tell the user plainly that it failed and "
+        "why — NEVER claim it worked, was created, fixed, or is ready; do not retry "
+        "the same failing tool more than once. If no tool is needed, just answer "
+        "directly. ROUTING: building or creating ANY software — a website, web "
+        "app, API, script, program, project, or code file — is a CODING task: "
+        "use the code_agent tool (or write_file if code_agent is unavailable). "
+        "The create_tool tool is ONLY for adding a new voice command/ability to "
+        "yourself (e.g. 'add a tool that tells jokes'); NEVER use create_tool to "
+        "build a website, app, script, program, or file."
     )
+
+
+@dataclass
+class CodeAgentConfig:
+    """Delegate coding tasks to a CrewAI agent running in an isolated venv
+    (.venv-crew) via a subprocess bridge (see code_agent.py / crew_runner.py).
+
+    CrewAI is kept out of Atlas's own environment because its dependency tree
+    would downgrade protobuf/pydantic and risk breaking onnxruntime (wake word,
+    vision, faces) and qdrant (memory). It runs on a cloud LLM, so this is the
+    one feature that leaves the machine. Best-effort: if the venv or an API key
+    isn't set up, the code_agent tool simply isn't offered and Atlas falls back
+    to its local coding tools.
+    """
+    enable_code_agent: bool = True
+    crew_venv: str = ".venv-crew"          # isolated env holding crewai
+    runner: str = "crew_runner.py"         # standalone script run inside it
+    timeout: int = 180                     # seconds (cloud + crew orchestration)
+    output_dir: str = "crew_output"        # plain (non-project) answers saved here
+    # When a request is to build a project/app/website, the agent emits its files
+    # and Atlas writes them to disk. Default base is the user's Desktop (or a
+    # folder named in the request: desktop/documents/downloads).
+    build_projects: bool = True
+
+    # A fresh CrewAI agent defined here (role/goal/backstory) — no CrewAI login
+    # or published repository needed; it runs on Gemini with just GEMINI_API_KEY.
+    # Override any of these in .env.
+    agent_role: str = field(default_factory=lambda: os.environ.get(
+        "ATLAS_CREW_AGENT_ROLE",
+        "Senior AI Software Engineer and Systems Architect"))
+    agent_goal: str = field(default_factory=lambda: os.environ.get(
+        "ATLAS_CREW_AGENT_GOAL",
+        "Turn the user's request into secure, scalable, maintainable, "
+        "well-tested code, following modern engineering best practices."))
+    agent_backstory: str = field(default_factory=lambda: os.environ.get(
+        "ATLAS_CREW_AGENT_BACKSTORY",
+        "A seasoned engineer specializing in software architecture, backend and "
+        "frontend development, APIs, databases, AI/LLM integrations, automation, "
+        "DevOps, and cloud-native applications. You write production-grade "
+        "solutions and explain key decisions concisely."))
+
+    # Gemini model via litellm (needs GEMINI_API_KEY). Override with ATLAS_CREW_MODEL.
+    model: str = field(default_factory=lambda: os.environ.get(
+        "ATLAS_CREW_MODEL", "gemini/gemini-2.5-flash"))

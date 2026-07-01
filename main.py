@@ -41,7 +41,7 @@ for _stream in (sys.stdout, sys.stderr):
 from config import (
     Config, LLMConfig, TTSConfig, PlaybackConfig, ToolsConfig, MemoryConfig,
     StateConfig, CacheConfig, RAGConfig, AgentsConfig, VisionConfig, FaceConfig,
-    AuthConfig,
+    AuthConfig, DspConfig, CodeAgentConfig,
 )
 import audio_input
 from speaker_id import SpeakerVerifier
@@ -55,6 +55,9 @@ from cache import Cache
 from rag import DocStore
 from vision import Vision
 from face_id import FaceRecognizer
+from code_agent import CodeAgent
+from meeting import MeetingRecorder
+from audio_dsp import NoiseSuppressor, EchoCanceller, ReferenceBuffer, MicStream
 import playback
 
 # A sentence is "complete" once we see end punctuation followed by whitespace;
@@ -75,46 +78,76 @@ def _flush_sentences(buffer: str) -> tuple[list[str], str]:
 
 
 def _bargein_watcher(stream, oww, cfg: Config,
-                     stop_event: threading.Event, interrupted: threading.Event) -> None:
+                     stop_event: threading.Event, interrupted: threading.Event,
+                     aec=None, refbuf=None) -> None:
     """While Atlas speaks, listen for the wake word and signal an interrupt.
 
     Runs only during playback, when the main loop is NOT reading the mic, so it
-    has exclusive access to the shared input stream. Assumes output goes to
-    headphones; on open speakers Atlas's own voice could false-trigger this.
+    has exclusive access to the shared input stream. When an echo canceller +
+    reference buffer are supplied, Atlas's own voice (the speaker output) is
+    cancelled from the mic first, so it works on open speakers without
+    false-triggering on itself; otherwise it assumes headphones.
     """
     oww.reset()
+    if aec is not None:
+        aec.reset()
+    if refbuf is not None:
+        refbuf.clear()
+    # Same guards as wait_for_wake_word: skip the warm-up spike window and
+    # require consecutive over-threshold chunks. Without these, the model's
+    # spurious spikes (or Atlas's own leaking voice) falsely "barge in" and
+    # cut off the end of the sentence being spoken.
+    warmup = max(0, getattr(cfg, "wake_warmup_chunks", 0))
+    need = max(1, getattr(cfg, "wake_consecutive", 1))
+    seen = 0
+    run = 0
     buf = np.empty(0, dtype=np.int16)
     while not stop_event.is_set():
         try:
-            frame, _ = stream.read(cfg.frame_samples)
+            frame, _ = stream.read_raw(cfg.frame_samples)
         except Exception:
             break
-        buf = np.concatenate([buf, frame[:, 0]])
+        pcm = frame[:, 0]
+        if aec is not None and refbuf is not None:
+            pcm = aec.cancel(pcm, refbuf.take(cfg.frame_samples))
+        buf = np.concatenate([buf, pcm])
         while len(buf) >= cfg.wake_chunk:
             chunk, buf = buf[: cfg.wake_chunk], buf[cfg.wake_chunk:]
             scores = oww.predict(np.ascontiguousarray(chunk))
+            seen += 1
+            if seen <= warmup:
+                run = 0
+                continue
             if max(scores.values()) >= cfg.wake_threshold:
-                interrupted.set()
-                stop_event.set()
-                return
+                run += 1
+                if run >= need:
+                    interrupted.set()
+                    stop_event.set()
+                    return
+            else:
+                run = 0
     oww.reset()
 
 
 def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
-             pb_cfg: PlaybackConfig, lang: str = "") -> bool:
+             pb_cfg: PlaybackConfig, lang: str = "", aec=None, refbuf=None,
+             bargein: bool = True) -> bool:
     """Generate, speak (streaming), and allow barge-in. Returns True if interrupted.
 
     `lang` is the detected input language; the reply is synthesized with the
     matching TTS voice (the LLM is already told to answer in that language).
+    `aec`/`refbuf`, if given, cancel Atlas's own voice from the mic during
+    barge-in (see audio_dsp.py). `bargein=False` disables the wake-word watcher
+    entirely — used in text mode, where Atlas shouldn't listen at all.
     """
     stop_event = threading.Event()
     interrupted = threading.Event()
 
     watcher = None
-    if pb_cfg.allow_barge_in:
+    if pb_cfg.allow_barge_in and bargein:
         watcher = threading.Thread(
             target=_bargein_watcher,
-            args=(stream, oww, cfg, stop_event, interrupted),
+            args=(stream, oww, cfg, stop_event, interrupted, aec, refbuf),
             daemon=True,
         )
         watcher.start()
@@ -138,7 +171,8 @@ def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
             if tail:
                 yield tts._synth(tail, lang)
 
-    playback.play_stream(audio_chunks(), tts.sample_rate, stop_event)
+    playback.play_stream(audio_chunks(), tts.sample_rate, stop_event,
+                         reference_sink=refbuf)
 
     stop_event.set()  # tell the watcher to stop if playback ended on its own
     if watcher is not None:
@@ -147,12 +181,82 @@ def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
     return interrupted.is_set()
 
 
+def _text_key_watcher(cfg: Config, toggle_event: threading.Event,
+                      stop_event: threading.Event) -> None:
+    """Set `toggle_event` on each press of the text-mode key (default F1).
+
+    Polls the global key state (Windows GetAsyncKeyState), so it works whether or
+    not the terminal is focused, without an extra dependency. Edge-triggered on
+    key-down. No-op on non-Windows. F1 toggles between voice mode and text mode.
+    """
+    import ctypes
+    import time
+
+    try:
+        get_state = ctypes.windll.user32.GetAsyncKeyState
+    except Exception:
+        return  # not Windows / no user32 — text mode unavailable
+    vk = cfg.text_input_vk
+    prev_down = False
+    while not stop_event.is_set():
+        down = bool(get_state(vk) & 0x8000)
+        if down and not prev_down:
+            toggle_event.set()
+        prev_down = down
+        time.sleep(0.04)
+
+
+def _text_mode_read(toggle_event: threading.Event):
+    """Read one typed line in text mode (Windows msvcrt, char by char).
+
+    Returns the line on Enter, or None if F1 was pressed (leave text mode). While
+    here the mic is NOT read — text mode means voice listening is off until you
+    press F1 again. Echoes input and supports backspace.
+    """
+    import msvcrt
+    import time
+
+    sys.stdout.write("  text> ")
+    sys.stdout.flush()
+    buf: list[str] = []
+    while True:
+        if toggle_event.is_set():           # F1 pressed -> exit text mode
+            toggle_event.clear()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return None
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf).strip()
+            if ch == "\x03":                # Ctrl+C
+                raise KeyboardInterrupt
+            if ch == "\x08":                # backspace
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if ch in ("\x00", "\xe0"):      # function/arrow key: drop 2nd code
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+        else:
+            time.sleep(0.015)
+
+
 def main() -> None:
     cfg = Config()
     llm_cfg = LLMConfig()
     tts_cfg = TTSConfig()
     tools_cfg = ToolsConfig()
     pb_cfg = PlaybackConfig()
+    auth_cfg = AuthConfig()
 
     print("Loading models...")
     oww = audio_input.load_wake_model(cfg)
@@ -200,6 +304,10 @@ def main() -> None:
     else:
         print(f"Faces: DISABLED — {faces.reason}.")
 
+    code_agent = CodeAgent(CodeAgentConfig())
+    print("Coding agent: " + ("CrewAI (delegated, isolated venv)."
+          if code_agent.available else f"DISABLED — {code_agent.reason}."))
+
     memory = Memory(MemoryConfig(), cache=cache)
     if memory.enabled:
         print(f"Memory: enabled ({memory.count()} stored).")
@@ -212,6 +320,7 @@ def main() -> None:
     else:
         print(f"State: DISABLED — {store.disabled_reason}.")
 
+    agents_cfg = AgentsConfig()
     tools = Tools(
         on_timer_fire=announce,
         web_search_backend=tools_cfg.web_search_backend,
@@ -222,30 +331,51 @@ def main() -> None:
         allow_power_off=tools_cfg.allow_power_off,
         vision=vision,
         faces=faces,
+        code_agent=code_agent,
+        transcriber=transcriber,
+        meeting_recorder=MeetingRecorder(cfg),
         memory=memory,
         store=store,
         voiceprint_path=cfg.voiceprint_path,
+        password_path=auth_cfg.password_path,
         enable_coding=tools_cfg.enable_coding,
         command_timeout=tools_cfg.command_timeout,
+        enable_self_extend=tools_cfg.enable_self_extend,
+        plugins_dir=tools_cfg.plugins_dir,
+        auto_install_deps=tools_cfg.auto_install_tool_deps,
+        test_mode=auth_cfg.test_mode,
+        admin_only_tools=agents_cfg.admin_only_tools,
     )
 
-    agents_cfg = AgentsConfig()
     brain = LLM(llm_cfg, tools=tools, memory=memory, store=store, docs=docs,
                 agents_cfg=agents_cfg)
+    # Local fallback for writing tool code when CrewAI isn't set up (create_tool
+    # prefers the CrewAI code_agent). Wired now that the LLM exists.
+    tools._code_gen = brain.raw_complete
+    # Let reset_all also wipe the live in-session conversation history.
+    tools._clear_session = brain.reset_session
     if brain.orchestrator is not None:
         confirm = "confirm risky actions" if agents_cfg.confirm_risky \
             else "fully autonomous"
         print(f"Agents: ReAct task loop (max {agents_cfg.max_iterations} "
               f"steps, {confirm}).")
 
+    # Test mode (ATLAS_TEST_MODE in .env) bypasses ALL auth — the startup
+    # identity gate (face/voice/password) and the per-turn speaker gate — so you
+    # can run Atlas without enrolling anything. Default off.
+    if auth_cfg.test_mode:
+        print("** TEST MODE: identity gate and speaker check DISABLED "
+              "(ATLAS_TEST_MODE). Not secure — for development only. **")
+    require_identity = auth_cfg.require_identity and not auth_cfg.test_mode
+    require_speaker = cfg.require_speaker_match and not auth_cfg.test_mode
+
     # A speaker verifier is needed for the per-turn gate AND for the startup
     # identity gate; create it if either is on. Voiceprint is loaded after any
     # first-run onboarding (below).
-    auth_cfg = AuthConfig()
-    need_verifier = cfg.require_speaker_match or auth_cfg.require_identity
+    need_verifier = require_speaker or require_identity
     verifier = SpeakerVerifier(cfg) if need_verifier else None
     voiceprint = None
-    if (cfg.require_speaker_match and not auth_cfg.require_identity
+    if (require_speaker and not require_identity
             and not os.path.exists(cfg.voiceprint_path)):
         raise SystemExit("No voiceprint found. Run `python enroll.py` first.")
 
@@ -254,8 +384,23 @@ def main() -> None:
     except Exception as e:
         raise SystemExit(f"Could not open the microphone: {e}")
 
+    # --- Audio DSP: noise suppression on capture + echo cancellation on barge-in ---
+    dsp_cfg = DspConfig()
+    suppressor = NoiseSuppressor() if dsp_cfg.enable_noise_suppression else None
+    if dsp_cfg.enable_noise_suppression:
+        ok = suppressor is not None and suppressor.available
+        print("Noise suppression: " + ("enabled (RNNoise)."
+              if ok else f"DISABLED — {suppressor.reason if suppressor else 'off'}."))
+    aec = refbuf = None
+    if dsp_cfg.enable_echo_cancellation:
+        aec, refbuf = EchoCanceller(dsp_cfg), ReferenceBuffer(dsp_cfg)
+        print("Echo cancellation: enabled (cancels Atlas's own voice on barge-in).")
+    stream = MicStream(stream, suppressor)
+
     # --- Startup identity gate: register on first run, then require face+voice ---
-    if auth_cfg.require_identity:
+    session_role = "admin"   # who's driving this session; gates admin-only tools
+    session = None
+    if require_identity:
         import auth
         if auth.needs_onboarding(cfg, auth_cfg, faces):
             print("First-time setup: registering your face and voice...")
@@ -263,8 +408,9 @@ def main() -> None:
         if verifier is not None and os.path.exists(cfg.voiceprint_path):
             voiceprint = verifier.load_voiceprint()
         print("Identity check — verify your face and voice to start Atlas.")
-        if not auth.authenticate(cfg, auth_cfg, verifier, voiceprint, faces,
-                                 stream, vad, announce):
+        session = auth.authenticate(cfg, auth_cfg, verifier, voiceprint, faces,
+                                    stream, vad, announce)
+        if not session:
             for c in (stream.stop, stream.close):
                 try:
                     c()
@@ -272,18 +418,90 @@ def main() -> None:
                     pass
             raise SystemExit("Identity not verified — Atlas will not start. "
                              "(Set AuthConfig.require_identity=False if locked out.)")
-    elif (cfg.require_speaker_match and verifier is not None
+        session_role = session.get("role") or "admin"
+        if session.get("voiceprint") is not None:
+            voiceprint = session["voiceprint"]   # per-turn gate uses their print
+        print(f"Signed in as {session.get('name')} (authority: {session_role}).")
+    elif (require_speaker and verifier is not None
             and os.path.exists(cfg.voiceprint_path)):
         voiceprint = verifier.load_voiceprint()
 
+    # Apply the session's authority to the tools (test mode leaves it fully
+    # unrestricted; a disabled gate / no identity means the owner = admin).
+    tools.set_authority("admin" if auth_cfg.test_mode else session_role)
+
+    # Tell the model who the user is so it can answer "who am I". Prefer the
+    # authenticated session; otherwise fall back to the registry (admin/first
+    # user), or a single enrolled face — works even in test mode.
+    import auth as _auth
+    owner_name, owner_role = None, session_role
+    if session:
+        owner_name = session.get("name")
+        owner_role = session.get("role") or session_role
+    else:
+        owner_name = _auth.admin_name(auth_cfg) or _auth._first_user(auth_cfg)
+        if owner_name:
+            owner_role = _auth._load_users(auth_cfg).get(
+                owner_name, {}).get("role", "admin")
+        elif faces is not None and getattr(faces, "available", False):
+            enrolled = [n for n in faces.names() if n and n.lower() != "owner"]
+            if len(enrolled) == 1:
+                owner_name, owner_role = enrolled[0], "admin"
+    if owner_name and owner_name.lower() != "owner":
+        brain.set_user_identity(owner_name, owner_role)
+        print(f"User identity: {owner_name} (authority: {owner_role}).")
+
+    # "Register a new user" at runtime (admin-only). After registering, if we
+    # still don't know who the user is, adopt the new admin/first user so
+    # "who am I" works without a restart.
+    def _register_and_adopt(name, role):
+        msg = _auth.register_new_user(cfg, auth_cfg, verifier, faces, stream,
+                                      announce, name, role)
+        if brain._user_identity is None:
+            who = _auth.admin_name(auth_cfg) or name
+            r = _auth._load_users(auth_cfg).get(who, {}).get("role", role)
+            if who and who.lower() != "owner":
+                brain.set_user_identity(who, r)
+        return msg
+    tools._register_user_fn = _register_and_adopt
+
     wake_name = os.path.splitext(os.path.basename(cfg.wake_model))[0] \
         if cfg.wake_model.endswith((".onnx", ".tflite")) else cfg.wake_model
-    print(f"Ready. Say the wake word ('{wake_name}'). Ctrl+C to quit.\n")
+
+    # Secondary input: F1 TOGGLES between voice mode and text mode. A background
+    # watcher sets toggle_event on each F1 press; the loop switches modes. In
+    # text mode the mic isn't read at all (voice listening is off until F1).
+    toggle_event = threading.Event()
+    text_stop = threading.Event()
+    text_input_on = cfg.enable_text_input and os.name == "nt"
+    if text_input_on:
+        threading.Thread(target=_text_key_watcher,
+                         args=(cfg, toggle_event, text_stop), daemon=True).start()
+
+    hint = " or press F1 to type" if text_input_on else ""
+    print(f"Ready. Say the wake word ('{wake_name}'){hint}. Ctrl+C to quit.\n")
+    if cfg.startup_phrase.strip():
+        announce(cfg.startup_phrase)   # speak the ready greeting aloud
     skip_wake = False   # barge-in: record immediately, no wake word
     follow_up = False   # hands-free follow-up: listen briefly without the wake word
+    text_mode = False   # F1 toggles this: in text mode, voice listening is off
+    restart = False     # reset_all sets this to relaunch the process
     try:
         while True:
-            if skip_wake:
+            typed_text = None
+            audio = np.empty(0, dtype=np.float32)  # set by the voice branches below
+
+            if text_mode:
+                # --- Text mode: type commands; voice listening is OFF. ---
+                line = _text_mode_read(toggle_event)
+                if line is None:                   # F1 pressed -> back to voice
+                    text_mode = False
+                    print("  (voice mode — say the wake word)\n")
+                    continue
+                if not line:
+                    continue                       # empty line -> stay in text mode
+                typed_text = line
+            elif skip_wake:
                 skip_wake = False
                 audio = audio_input.record_until_silence(stream, vad, cfg)
             elif follow_up:
@@ -295,34 +513,64 @@ def main() -> None:
                     print("  (no follow-up — say the wake word)\n")
                     continue  # window expired; wait for the wake word next
             else:
-                audio_input.wait_for_wake_word(stream, oww, cfg)
+                # Drop any audio buffered while Atlas was speaking (incl. its
+                # own greeting/replies) so it can't wake itself. Then wait for
+                # the wake word, or F1 to switch into text mode.
+                if hasattr(stream, "drain"):
+                    stream.drain()
+                oww.reset()
+                woke = audio_input.wait_for_wake_word(
+                    stream, oww, cfg, interrupt=toggle_event if text_input_on else None)
+                if not woke:                       # F1 pressed -> enter text mode
+                    toggle_event.clear()
+                    text_mode = True
+                    print("  (text mode — type commands; press F1 for voice)")
+                    continue
                 print("(listening...)")
                 audio = audio_input.record_until_silence(stream, vad, cfg)
 
-            if audio.size == 0:
-                print("  (no speech detected)\n")
-                continue
-
-            # --- Speaker gate (personalization, NOT security; spoofable) ---
-            # Only per-turn; a verifier may also exist solely for the startup
-            # identity gate, which must not silently filter every command here.
-            if cfg.require_speaker_match and verifier is not None \
-                    and voiceprint is not None:
-                is_match, score = verifier.verify(audio, voiceprint)
-                if not is_match:
-                    print(f"  speaker not recognized (score {score:.2f}) — ignoring.\n")
+            if typed_text is not None:
+                # --- Typed command: skip recording, speaker gate, and STT ---
+                text, lang = typed_text, (cfg.stt_language or "en")
+                print(f"  you [text]: {text}")
+            else:
+                if audio.size == 0:
+                    print("  (no speech detected)\n")
+                    if cfg.not_understood_phrase.strip():
+                        announce(cfg.not_understood_phrase)
                     continue
-                print(f"  speaker verified (score {score:.2f}).")
 
-            # --- Transcribe (auto-detects language) ---
-            text, lang = transcriber.transcribe(audio)
-            if not text:
-                print("  (no speech recognized)\n")
-                continue
-            print(f"  you [{lang}]: {text}")
+                # --- Speaker gate (personalization, NOT security; spoofable) ---
+                # Only per-turn; a verifier may also exist solely for the startup
+                # identity gate, which must not silently filter every command here.
+                if require_speaker and verifier is not None \
+                        and voiceprint is not None:
+                    is_match, score = verifier.verify(audio, voiceprint)
+                    if not is_match:
+                        print(f"  speaker not recognized (score {score:.2f}) — ignoring.\n")
+                        continue
+                    print(f"  speaker verified (score {score:.2f}).")
 
-            # --- Think + speak (with barge-in), replying in the same language ---
-            if _respond(brain, tts, text, stream, oww, cfg, pb_cfg, lang):
+                # --- Transcribe (auto-detects language) ---
+                text, lang = transcriber.transcribe(audio)
+                if not text:
+                    print("  (no speech recognized)\n")
+                    if cfg.not_understood_phrase.strip():
+                        announce(cfg.not_understood_phrase)
+                    continue
+                print(f"  you [{lang}]: {text}")
+
+            # --- Think + speak. In text mode, no barge-in (voice stays off). ---
+            interrupted = _respond(brain, tts, text, stream, oww, cfg, pb_cfg,
+                                   lang, aec=aec, refbuf=refbuf,
+                                   bargein=(typed_text is None))
+            if tools.restart_requested:            # reset_all asked to restart
+                restart = True
+                break
+            if typed_text is not None:
+                print()
+                continue                           # stay in text mode
+            if interrupted:
                 print("  (interrupted — listening)\n")
                 skip_wake = True
             elif cfg.enable_followup:
@@ -334,6 +582,7 @@ def main() -> None:
         # Release resources, each guarded so one failure can't block the rest.
         # Order matters: flush/close the memory store so its lock is released.
         for cleanup in (
+            text_stop.set,
             tools.cancel_all,
             memory.close,
             store.close,
@@ -346,11 +595,17 @@ def main() -> None:
                 cleanup()
             except Exception:
                 pass
-        # Force the process to exit. llama-cpp / PortAudio / onnxruntime can
-        # leave non-daemon threads or native resources alive that otherwise hang
-        # interpreter shutdown — which would keep the embedded Qdrant lock held
-        # and break memory on the next run. We've already closed everything that
-        # needs flushing above, so a hard exit here is safe.
+        # Relaunch (after a reset) now that locks/mic are released, so onboarding
+        # runs fresh; otherwise force-exit. We've already closed everything that
+        # needs flushing above. (llama-cpp / PortAudio / onnxruntime can leave
+        # native threads alive that would otherwise hang interpreter shutdown and
+        # keep the embedded Qdrant lock held.)
+        if restart:
+            try:
+                print("\nRestarting Atlas...\n", flush=True)
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+            except Exception:
+                pass
         os._exit(0)
 
 

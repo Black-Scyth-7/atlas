@@ -9,12 +9,18 @@ are reversible and always allowed.
 
 import ctypes
 import datetime
+import glob
+import json
 import os
 import re
+import shutil
 import subprocess
 import webbrowser
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
+
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 # Virtual-key codes for media/volume keys (tapped via keybd_event).
 _MEDIA_VK = {
@@ -323,6 +329,98 @@ def set_app_volume(app: str, percent=None, mute=None) -> str:
     return f"Set {matched} volume to {int(percent)} percent."
 
 
+def _find_start_menu_shortcut(name: str):
+    """Best-matching Start-menu .lnk for `name` (most installed apps have one)."""
+    name_l = name.strip().lower()
+    roots = [
+        os.path.join(os.environ.get("ProgramData", ""),
+                     r"Microsoft\Windows\Start Menu\Programs"),
+        os.path.join(os.environ.get("APPDATA", ""),
+                     r"Microsoft\Windows\Start Menu\Programs"),
+    ]
+    best, best_score = None, 0
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for path in glob.iglob(os.path.join(root, "**", "*.lnk"), recursive=True):
+            stem = os.path.splitext(os.path.basename(path))[0].lower()
+            score = (3 if stem == name_l else 2 if stem.startswith(name_l)
+                     else 1 if name_l in stem else 0)
+            if score > best_score:
+                best, best_score = path, score
+    return best
+
+
+def _resolve_app(target: str) -> bool:
+    """True if `target` is launchable: on PATH or registered in App Paths."""
+    exe = target if target.lower().endswith(".exe") else target + ".exe"
+    if shutil.which(target) or shutil.which(exe):
+        return True
+    try:
+        import winreg
+        sub = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + exe
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                winreg.CloseKey(winreg.OpenKey(hive, sub))
+                return True
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+def _reachable(url: str) -> bool:
+    """True if `url` responds without a client/DNS error (status < 400)."""
+    for method in ("HEAD", "GET"):
+        try:
+            resp = urlopen(Request(url, headers={"User-Agent": _UA},
+                                   method=method), timeout=6)
+            return getattr(resp, "status", 200) < 400
+        except Exception:
+            continue
+    return False
+
+
+def _find_official_site(name: str):
+    """Best-effort official website for an app name, or None.
+
+    1) DuckDuckGo's Instant-Answer API (its entity 'Results' link, e.g.
+       'obs studio' -> obsproject.com), then
+    2) a verified '<name>.com' guess (covers discord/notion/figma/zoom/...).
+    """
+    try:
+        q = quote_plus(name)
+        raw = urlopen(Request(
+            f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&no_redirect=1",
+            headers={"User-Agent": _UA}), timeout=8).read().decode("utf-8", "ignore")
+        data = json.loads(raw)
+        for r in data.get("Results", []):
+            u = r.get("FirstURL")
+            if u and "wikipedia.org" not in u:
+                return u
+    except Exception:
+        pass
+
+    slug = re.sub(r"[^a-z0-9]", "", name.lower())
+    if slug:
+        for guess in (f"https://{slug}.com", f"https://www.{slug}.com"):
+            if _reachable(guess):
+                return guess
+    return None
+
+
+def _open_site_fallback(key: str, raw: str) -> str:
+    """App isn't installed -> open its website (or web results as a last resort)."""
+    site = _find_official_site(raw)
+    if site:
+        _open_url(site)
+        return (f"I couldn't find {key} installed, so I opened its website "
+                f"instead: {site}")
+    _open_url("https://duckduckgo.com/?q=" + quote_plus(raw))
+    return f"I couldn't find {key} installed, so I searched the web for it."
+
+
 def open_app(name: str) -> str:
     key = name.strip().lower()
     target = _APPS.get(key, name.strip())
@@ -331,8 +429,17 @@ def open_app(name: str) -> str:
     try:
         if target.endswith(":") or target.startswith("microsoft."):
             os.startfile(target)  # protocol / UWP app  # noqa: S606
-        else:
-            subprocess.Popen(target, shell=True)  # resolves PATH / App Paths
+            return f"Opening {key}."
+        # For arbitrary (non-builtin) names, confirm the app actually exists
+        # before claiming success — otherwise fall back to opening its website.
+        if key not in _APPS:
+            lnk = _find_start_menu_shortcut(target)
+            if lnk:
+                os.startfile(lnk)                  # most reliable for GUI apps
+                return f"Opening {key}."
+            if not _resolve_app(target):
+                return _open_site_fallback(key, name.strip())
+        subprocess.Popen(target, shell=True)       # resolves PATH / App Paths
         return f"Opening {key}."
     except Exception as e:
         return f"Couldn't open {key}: {e}"
@@ -351,10 +458,72 @@ _CLOSE_NAMES = {
 _CLOSE_DENYLIST = {"explorer.exe", "svchost.exe", "winlogon.exe", "csrss.exe",
                    "system.exe", "python.exe", "pythonw.exe"}
 
+# A website/URL rather than an app, e.g. "github.com", "https://x.org/page".
+# Restricted to common TLDs so app names like "node.js" aren't misread as sites.
+_SITE_RE = re.compile(
+    r"^(https?://)?([a-z0-9-]+\.)+(com|org|net|io|gov|edu|co|dev|ai|app|me|"
+    r"info|xyz|us|uk|in|biz|tv|online|site|tech)(/|$)", re.IGNORECASE)
+
+
+def _site_keyword(name: str) -> str:
+    """Main label of a domain: 'github.com' -> 'github', 'www.google.com' -> 'google'."""
+    host = re.sub(r"^https?://", "", name.strip(), flags=re.IGNORECASE).split("/")[0]
+    parts = [p for p in host.split(".") if p]
+    return (parts[-2] if len(parts) >= 2 else host).lower()
+
+
+def _close_browser_windows(keyword: str) -> int:
+    """Post WM_CLOSE to visible browser windows whose title contains `keyword`
+    (e.g. 'github'). Returns how many were signalled. Windows-only, no deps."""
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.PostMessageW.argtypes = [wintypes.HWND, ctypes.c_uint,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        WM_CLOSE = 0x0010
+        browsers = ("edge", "chrome", "firefox", "brave", "opera")
+        hits: list = []
+        EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n > 0:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                low = buf.value.lower()
+                if keyword in low and any(b in low for b in browsers):
+                    hits.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumProc(_cb), 0)
+        for hwnd in hits:
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        return len(hits)
+    except Exception:
+        return 0
+
 
 def close_app(name: str) -> str:
     """Close a running application by name (graceful taskkill by image name)."""
     key = name.strip().lower()
+
+    # A website (opened in the browser) can't be killed as a process — close the
+    # browser window that's showing it instead.
+    if _SITE_RE.match(key):
+        if _close_browser_windows(_site_keyword(key)):
+            return f"Closed the browser window showing {key}."
+        r = subprocess.run(["taskkill", "/IM", "msedge.exe"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return f"Closed the browser where {key} was open."
+        return f"I don't see {key} open in a browser."
+
     img = _CLOSE_NAMES.get(key, name.strip())
     if not img.lower().endswith(".exe"):
         img += ".exe"

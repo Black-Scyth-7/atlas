@@ -36,6 +36,7 @@ CLI). Everything else is local.
 | **Conversation** | Natural spoken Q&A with short rolling memory, grounded in the current date. Answers in English. |
 | **Multi-step tasks** | Acts as an iterative **ReAct agent** — chains several tool calls, observing each result, to complete a single spoken request (e.g. *"open Notepad and write a haiku"*). |
 | **Web search** | Live web answers via Tavily (REST or MCP) or DuckDuckGo, with automatic fallback and caching. |
+| **Web & info** | Read/summarize a URL, weather, news, stock & crypto prices, translate, safe calculator, currency & unit conversion (free, no API keys). |
 | **System control** | Set system/per-app volume, screen brightness, take screenshots, lock/sleep/shutdown. |
 | **Media** | Play a song from YouTube; play/pause/next/previous of whatever's already playing; say what's now playing (Windows SMTC). |
 | **Apps & windows** | Open and close applications and websites. |
@@ -44,12 +45,17 @@ CLI). Everything else is local.
 | **Vision-guided control** | Find a UI element by description and click/type into it (*"click the Save button"*) — operating apps it can see, not just ones with named tools. Best on large, labeled targets. |
 | **Camera** | Look through the webcam (*"look at me"*, *"what am I holding?"*) and take photos, interpreted by the same local vision model. |
 | **Facial recognition** | Enroll people by name and identify who's at the camera (*"who is this?"*, *"remember my face as Alex"*) via local ArcFace embeddings. |
-| **Identity gate** | First run registers your face + voice; every later startup requires both to match before Atlas will start. |
+| **Identity gate** | First run registers a password + your face + voice; every later startup requires all three before Atlas will start. |
 | **Coding** | Write, read, and edit source files, and run/compile/test code by voice — the agent can iterate on errors. |
+| **Cloud coding agent** | Optionally delegate coding tasks to a locally-defined **CrewAI** agent running on **Gemini**, in an isolated env. |
 | **Developer** | Create a GitHub repository by voice via the `gh` CLI. |
-| **Memory** | Remembers across sessions (semantic recall) and keeps a durable transcript + profile. |
+| **Self-extension** | Write *new* tools/functions into its own code on request (*"add a tool that…"*) — saved as plugins and available immediately + after restart. |
+| **Memory / learning** | Remembers across sessions (semantic recall), and *learns* your facts/preferences/corrections on request (*"remember that…"*, *"forget that…"*) — always applied thereafter. |
 | **Your documents** | Answers grounded in your own files (RAG over `docs/`). |
-| **Hands-free** | Wake-word activation, barge-in (interrupt mid-reply), and a follow-up window so you needn't repeat the wake word. |
+| **Documents & OCR** | Read/answer/summarize a PDF or text file on demand, and OCR (read all text from) the screen or an image. |
+| **Meeting assistant** | Record a meeting, transcribe it, and write up a summary + action items. |
+| **Hands-free** | Wake-word activation, barge-in (interrupt mid-reply), and a follow-up window so you needn't repeat the wake word. Or press **F1** to type a command instead. |
+| **Clean audio** | RNNoise noise suppression so it hears you in a noisy room, and echo cancellation so it doesn't trigger on its own voice from the speakers. |
 | **Safety** | Pauses and asks for a spoken *"yes"* before irreversible actions (close app, create repo, shutdown, factory reset). |
 | **Factory reset** | *"Reset yourself"* wipes everything — all memory, conversation history, cache, and your enrolled voice + face (after confirmation). |
 
@@ -118,6 +124,7 @@ daemons are required for the core pipeline.
 | --- | --- | --- |
 | Wake word | **openWakeWord** (ONNX runtime) | Custom locally-trained "Atlas" model. |
 | Recording | **webrtcvad** + **sounddevice** (PortAudio) | Voice-activity detection trims silence. |
+| Audio cleanup | **RNNoise** (noise suppression) + numpy frequency-domain **AEC** | Denoise the mic; cancel the speaker echo. |
 | Speaker gate | **SpeechBrain** ECAPA-TDNN (PyTorch, CPU) | Cosine-similarity voiceprint match. |
 | Speech-to-text | **faster-whisper** (CTranslate2) | `small` model, CPU, int8. |
 | LLM brain | **Qwen3-8B** (Q4_K_M GGUF) via **llama-cpp-python** | In-process, GPU or CPU, streaming. |
@@ -221,11 +228,11 @@ by `TTSConfig` in `config.py`).
 python main.py
 ```
 
-With the [identity gate](#startup-identity-gate-face--voice-login) on by default,
-the **first launch walks you through registering your face and voice** (look at
-the camera, then repeat a few phrases). Every later launch then asks you to
-verify both before Atlas starts. Say **"Atlas"**, speak a command, and it replies
-aloud. Ctrl+C to quit.
+With the [identity gate](#startup-identity-gate-password--face--voice-login) on by default,
+the **first launch walks you through registering your face, voice, and a typed
+password** (look at the camera, repeat a few phrases, then set a password). Every
+later launch then asks you to verify all three before Atlas starts. Say
+**"Atlas"**, speak a command, and it replies aloud. Ctrl+C to quit.
 
 *Optional manual enrollment / tuning* (also usable any time to add samples):
 
@@ -251,8 +258,10 @@ Memory: enabled (128 stored).
 State: enabled (310 messages logged).
 Faces: enabled (1 enrolled: owner).
 Agents: ReAct task loop (max 8 steps, confirm risky actions).
-Identity check — verify your face and voice to start Atlas.
-Ready. Say the wake word ('atlas'). Ctrl+C to quit.
+Noise suppression: enabled (RNNoise).
+Echo cancellation: enabled (cancels Atlas's own voice on barge-in).
+Identity check — verify your password, face, and voice to start Atlas.
+Ready. Say the wake word ('atlas') or press F1 to type. Ctrl+C to quit.
 ```
 
 ---
@@ -529,6 +538,11 @@ Then, by voice:
   Handles multiple people in frame.
 - **`enroll_face`** — *"remember my face as Alex"*, *"this is Sam"* → saves the
   current face under that name for next time.
+- **`open_face_window`** — *"open the face recognition window"* → opens a live
+  webcam window (`face_window.py`) with boxes + names drawn on faces (green +
+  name/score for enrolled people, red "unknown" otherwise); recognition runs on
+  a background thread so the video stays smooth. Press **q** to close. Also
+  runnable standalone: `python face_window.py`.
 
 Startup prints `Faces: enabled (N enrolled: …)` or
 `Faces: DISABLED — <reason>`. Tune via `FaceConfig`: `match_threshold` (cosine
@@ -538,41 +552,63 @@ similarity to count as a match — raise to be stricter), `min_det_score`,
 > **Personalization, not security.** Like the voice gate, face recognition can be
 > fooled by a photo of someone. Don't use it to protect anything sensitive.
 
-### Startup identity gate (face + voice login)
+### Startup identity gate (password + face + voice login)
 
-Atlas can require **you** — your face *and* your voice — before it will start
-(`auth.py`, config in `AuthConfig`, on by default):
+Atlas can require **you** — a typed password **and** your face **and** your voice
+— before it will start (`auth.py`, config in `AuthConfig`, on by default):
 
 - **First ever run** → onboarding. Atlas speaks you through registering your
-  **face** (a few webcam shots) and your **voice** (repeat a few short phrases),
-  saving `faces.npz` and `voiceprint.npy`.
-- **Every later run** → login. Atlas asks you to look at the camera and say
-  something, and starts **only if both the face and the voice match** the owner.
-  You get `auth_attempts` tries (default 3); otherwise it refuses to start.
+  **face** (a few webcam shots → `faces.npz`), your **voice** (repeat a few short
+  phrases → `voiceprint.npy`), and a **password** (typed twice → stored only as a
+  salted PBKDF2-SHA256 hash in `auth_secret.dat`, never in plaintext).
+- **Every later run** → login. Atlas asks you to **type your password** (hidden
+  input), then look at the camera and say something, and starts **only if all
+  three match**. The password is checked first (cheapest, and a true secret); you
+  get `auth_attempts` tries (default 3) per factor, otherwise it refuses to start.
 
 ```text
-First-time setup: registering your face and voice...
-Identity check — verify your face and voice to start Atlas.
+First-time setup: registering your face, voice, and password...
+Identity check — verify your password, face, and voice to start Atlas.
+  Password: ********
   [auth] voice score 0.71 (ok).
 Ready. Say the wake word ('atlas').
 ```
 
-Tune via `AuthConfig`: `require_identity` (master switch), `owner_name`,
-`face_shots`, `voice_samples`, `voice_seconds`, `auth_attempts`. The face match
-uses `FaceConfig.match_threshold`; the voice match uses `Config.speaker_threshold`.
-If face recognition or the camera is unavailable, the gate **degrades to
-voice-only** rather than locking you out. After a [factory reset](#factory-reset)
-(which clears both enrollments), the next startup automatically re-runs
-onboarding.
+The **password** is the one factor that's genuinely a secret — unlike face/voice,
+it can't be spoofed by a photo or a recording. Tune via `AuthConfig`:
+`require_identity` (master switch), `require_password`, `owner_name`, `face_shots`,
+`voice_samples`, `voice_seconds`, `auth_attempts`. The face match uses
+`FaceConfig.match_threshold`; the voice match uses `Config.speaker_threshold`. If
+face recognition or the camera is unavailable, the gate **degrades** to the
+remaining factors rather than locking you out. After a
+[factory reset](#factory-reset) (which clears all three), the next startup
+automatically re-runs onboarding.
 
-> **Personalization, not security — important here.** This gate is convenience
-> and personalization, **not** real authentication: a photo of you can pass the
-> face check and a recording of your voice can pass the voice check. Do not treat
-> it as protecting access to the machine. **If you ever get locked out** (bad
-> lighting, broken camera, lost voiceprint), set `AuthConfig.require_identity =
-> False` in `config.py` to disable it.
+> **Mixed strength — read this.** The **password** is real authentication (a
+> salted hash of a secret you know). The **face and voice** checks are
+> personalization and are spoofable (a photo / a recording can pass them), so
+> they add convenience, not strong security. **If you get locked out** (bad
+> lighting, broken camera, lost voiceprint, forgotten password), set
+> `AuthConfig.require_identity = False` in `config.py`, or delete
+> `auth_secret.dat` to reset just the password (you'll set a new one on the next
+> run).
+
+**Test mode.** For frictionless development you can skip the whole gate (and the
+per-turn speaker check) without enrolling anything. It's toggled in `.env` and is
+**disabled by default**:
+
+```ini
+ATLAS_TEST_MODE=true     # skip all auth — NOT secure, dev only
+```
+
+When on, startup prints a `** TEST MODE … **` warning and goes straight to the
+wake word. Set it back to `false` (or remove the line) to restore the gate.
 
 ### Coding agent (write, edit, and run code)
+
+> These local coding tools are the **fallback**: if the [CrewAI cloud coding
+> agent](#cloud-coding-agent-crewai-optional) is set up, it takes over all coding
+> and these aren't registered. They're used only when CrewAI is absent.
 
 Atlas can actually build code on disk, not just dictate it. Combined with the
 ReAct loop, it writes a file, runs it, reads the error, fixes it, and runs
@@ -606,7 +642,9 @@ returns:
 ```
 
 File paths are unrestricted — Atlas reads and writes wherever you tell it
-(`~` and relative paths are resolved). Because that's powerful, the actions
+(`~`, relative paths, and **Desktop / Documents / Downloads** references are
+resolved to your real folders, including OneDrive-redirected ones, so *"on my
+desktop"* lands in the right place instead of a guessed username path). Because that's powerful, the actions
 that execute code or destroy data are gated by a spoken **"yes"**:
 **`run_command`** and **`debug_python`** (both run code on your machine) and
 **`write_file` when it would overwrite an existing file** (creating new files,
@@ -616,6 +654,88 @@ the whole feature off with `enable_coding = False`.
 Example — *"write a Python script in C:\\tmp\\fib.py that prints the first ten
 Fibonacci numbers, then run it"*: the agent calls `write_file`, then asks to
 confirm `run_command`, and on "yes" runs it and reads you the output.
+
+### Self-extension (Atlas writes its own tools)
+
+Atlas can permanently add **new tools/functions to itself** when you ask
+(*"add a tool that tells me a random joke"*, *"create a function that converts
+Celsius to Fahrenheit"*). Rather than editing the core `tools.py` (risky), each
+new capability is saved as a **plugin file** in `plugins/`:
+
+- **`create_tool`** — the agent writes a `name`, `description`, an `arguments`
+  schema, and the Python `code` (`def run(args): … return "<spoken result>"`).
+  Atlas validates it (it must compile and define `run`), saves
+  `plugins/<name>.py`, and **registers it live** — so it's usable in the same
+  conversation *and* auto-loaded on every future startup.
+- **`remove_tool`** — deletes a custom tool you previously added (built-ins are
+  protected and can't be removed or overwritten).
+
+**Dependencies install automatically.** The tool code is written by the CrewAI
+agent (with the local model as fallback), and may use third-party packages — it
+declares them on a `# pip: <packages>` first line. `create_tool` **pip-installs
+those into Atlas's venv** before validating, so the new tool works immediately
+(e.g. *"Added a new tool 'fetch_weather' (installed: requests)."*). If a plugin's
+dependency is ever missing at startup, Atlas reinstalls it from that `# pip:`
+line. Turn this off with `ToolsConfig.auto_install_tool_deps = False`.
+
+On startup Atlas prints `Custom tools: loaded N from plugins/.` if any exist.
+Configure via `ToolsConfig` (`enable_self_extend`, `plugins_dir`,
+`auto_install_tool_deps`).
+
+> **This is self-modifying code that runs in-process.** A new tool's code
+> executes with Atlas's full permissions, so `create_tool` and `remove_tool` are
+> gated by the agent's spoken confirmation (*"I'm about to write a new tool
+> called '…' into my own code — should I go ahead?"*). Built-in tools can't be
+> overwritten, names are sanitised, and code that doesn't compile or define
+> `run` is rejected without being saved — but a tool you ask it to write can
+> still do whatever its code says. Review `plugins/` if in doubt; delete a file
+> to remove a tool. Turn the feature off with `enable_self_extend = False`.
+
+### Cloud coding agent (CrewAI, optional)
+
+For heavier coding, Atlas delegates the task to a **CrewAI agent** running on
+**Gemini** (`code_agent.py` + `crew_runner.py`, config in `CodeAgentConfig`). The
+agent is **defined locally** — a role/goal/backstory senior-engineer (no CrewAI
+login or published repository needed). When you give a coding command, the
+`code_agent` tool runs it. For a **project/app/website** it builds the actual
+files on disk (in a named subfolder of your **Desktop** by default, or
+Documents/Downloads if you say so) and reports where; for a one-off snippet it
+saves the answer to `crew_output/`. Either way it speaks a short confirmation.
+
+**Why a separate environment.** CrewAI's dependencies would downgrade
+`protobuf` and `pydantic` in Atlas's venv, which can break onnxruntime (wake
+word, vision, faces) and qdrant (memory). So CrewAI is installed in an **isolated
+`.venv-crew`** and Atlas talks to it over a **subprocess bridge** (JSON via a
+pipe) — your core stack is never touched.
+
+Setup (one time):
+
+```powershell
+python setup_crew.py                 # creates .venv-crew, installs crewai[google-genai]
+```
+
+Then in `.env` set your Gemini key (from Google AI Studio):
+
+```ini
+GEMINI_API_KEY=...
+# ATLAS_CREW_MODEL=gemini/gemini-2.5-flash      # optional model override
+# ATLAS_CREW_AGENT_ROLE / _GOAL / _BACKSTORY    # optional persona overrides
+```
+
+> **Model note:** the default is `gemini/gemini-2.5-flash`. Some keys have no
+> free-tier quota for `gemini-2.0-flash` (a `429 … limit: 0`); switch models via
+> `ATLAS_CREW_MODEL` if you hit a quota/availability error.
+
+Startup prints `Coding agent: CrewAI (…)` or `DISABLED — <reason>`. It's
+**best-effort and off until set up**. **When the CrewAI agent is active it owns
+all coding** — the local coding tools (`write_file`, `run_command`,
+`debug_python`, …) are **not** registered, so every coding request goes to
+CrewAI. They come back automatically as the **fallback** only when CrewAI is
+absent (no `.venv-crew`/key), so Atlas can still code locally.
+
+> **Privacy + cost.** This is the one feature that leaves the machine — coding
+> prompts and code go to the cloud LLM, which needs an API key/billing, and each
+> task takes several seconds. The slug must exist in your CrewAI org/repo.
 
 ### Developer: create a GitHub repository
 
@@ -634,8 +754,25 @@ Atlas remembers across sessions via **semantic memory** (`memory.py`):
 - Each turn, the query is embedded, the most relevant past memories are injected
   into the LLM context, and the new exchange is stored afterward.
 
+**This is how Atlas "learns."** Rather than retraining the model (it runs as a
+quantized GGUF, which is inference-only), Atlas adapts to you through memory — no
+GPU cost, no risk of breaking the model, effective immediately:
+
+- **`remember`** — when you say *"remember that…"*, *"from now on…"*, *"call me…"*,
+  or correct it (*"no, it's actually…"*), Atlas saves that as an explicit **note**.
+- Notes are **always injected** into every turn's context as *standing
+  instructions to honor* (not just recalled when a topic happens to match), so
+  preferences and corrections **reliably stick**.
+- **`forget`** — *"forget that I like X"* removes the closest matching note (with
+  a high similarity threshold so it won't delete the wrong one).
+
 Toggle/tune via `MemoryConfig` (`enable_memory`, `recall_k`, `score_threshold`).
 Test standalone with `python memory.py`. Delete `qdrant_data/` to wipe memories.
+
+> Note: actual weight **fine-tuning** (LoRA on the full-precision model, then
+> re-quantizing to GGUF) is a separate offline, GPU-heavy batch job — not live
+> self-training. Memory-based learning above is the safe, instant path and is
+> what's built in.
 
 > **Run one instance at a time.** The embedded store is single-process; a second
 > `main.py` (or a leftover one still running) can't open it and will start with
@@ -677,14 +814,59 @@ the **`reset_all`** tool, which erases all of Atlas's personal state in one go:
 - **semantic memory** (Qdrant collection),
 - **conversation history + profile** (Postgres),
 - **cache** (all `atlas:*` keys in Redis),
-- your **voice enrollment** (`voiceprint.npy`), and
-- your **face enrollment** (`faces.npz`).
+- your **voice enrollment** (`voiceprint.npy`),
+- your **face enrollment** (`faces.npz`), and
+- your **startup password** (`auth_secret.dat`).
 
 It's irreversible, so it's gated by the agent's spoken confirmation (*"I'm about
-to factory-reset everything … Should I go ahead?"* → say **"yes"**). Afterwards,
-re-enroll with `python enroll.py` (voice) and `python enroll_face.py <name>`
-(face) before those features work again. Each store is cleared independently, so
-a reset still succeeds if, say, Postgres is down (it just skips that one).
+to factory-reset everything … Should I go ahead?"* → say **"yes"**). Afterwards
+the next startup re-runs onboarding (face, voice, and password). Each store is
+cleared independently, so a reset still succeeds if, say, Postgres is down (it
+just skips that one).
+
+### Web & info
+
+Focused tools that return clean spoken answers, using **free endpoints (no API
+keys)** or the local model (`tools.py`):
+
+- **`read_url`** — fetch a web page and summarize it (or answer a question about
+  it). *"Read me this link", "summarize that article."*
+- **`get_weather`** — current conditions for a city (or your location) via
+  `wttr.in`.
+- **`get_news`** — top headlines (or about a topic) from Google News RSS.
+- **`get_stock`** — latest price + daily change for a ticker (Yahoo Finance).
+- **`get_crypto`** — price + 24h change in USD (CoinGecko); accepts names or
+  symbols (`btc`, `eth`, …).
+- **`translate`** — translate text into any language (local model, offline).
+- **`calculate`** — safe math (arithmetic + functions like `sqrt`, `sin`, and
+  `pi`/`e`) evaluated with an AST walker — **no `eval`/code execution**.
+- **`convert_currency`** — latest-rate currency conversion (Frankfurter/ECB).
+- **`convert_units`** — length, mass, volume, and temperature conversions.
+
+### Productivity: documents, OCR & meetings
+
+Local productivity tools (`tools.py`, with the meeting recorder in `meeting.py`):
+
+- **`read_pdf`** — read a PDF / txt / md file (via `pypdf`) and return its text,
+  or answer a question about it. Paths resolve `~`/Desktop/Documents like the
+  coding tools. *"Read me that PDF on my desktop."*
+- **`summarize_document`** — read a pdf/txt/md and produce a short summary + key
+  points (map-reduce over long files, on the local model). *"Summarize report.pdf."*
+- **`read_text` (OCR)** — read **all** the text in the **screen** or an **image
+  file**, verbatim, using the local vision model (no Tesseract install needed).
+  *"Read the text on screen", "extract the text from this image."*
+- **`start_meeting` / `stop_meeting`** — `start_meeting` records the meeting from
+  the microphone in the background (you can keep talking to Atlas); `stop_meeting`
+  transcribes it with Whisper, writes a **summary + key points + action items**,
+  saves the notes and full transcript to `meetings/`, and reads you a one-line
+  recap.
+
+> **Meeting audio caveat.** It records from the **microphone**, so it captures
+> your voice, anyone on open speakers, and in-person rooms — but **not** system
+> audio when you're on **headphones** (remote calls). That needs WASAPI loopback,
+> which this `sounddevice` build doesn't expose; a `soundcard`-based loopback
+> capture can be added if you need it. Recording is held in memory, so keep
+> sessions reasonable (tens of minutes).
 
 ### Hands-free follow-up
 
@@ -694,11 +876,55 @@ returns to wake-word mode. Toggle with `enable_followup`. (Leading silence is
 trimmed from each clip so the speaker gate isn't thrown off by the pause before
 you speak.)
 
+### Noise suppression & echo cancellation
+
+Two mic-side DSP stages clean the audio before the wake word / VAD / STT see it
+(`audio_dsp.py`, config in `DspConfig`). Both are best-effort — if a backend
+can't load, that stage passes audio through and Atlas keeps working.
+
+- **Noise suppression (RNNoise).** The recorded **command** audio is denoised by
+  **RNNoise** (a small recurrent denoiser, run at its native 48 kHz and
+  resampled around our 16 kHz pipeline), so voice-activity detection and
+  transcription hold up in a **noisy room**. The **wake word runs on raw audio**
+  — the openWakeWord model is trained on raw mic input (with noise augmentation),
+  and denoising shifts the signal enough to hurt detection, so it's applied
+  downstream only. RNNoise ships as a tiny bundled DLL inside `pyrnnoise`; Atlas
+  loads that low-level binding directly (sidestepping the package's heavy PyAV
+  dependency).
+- **Acoustic echo cancellation (AEC).** So Atlas doesn't **trigger on its own
+  voice** coming out of the speakers, a frequency-domain (partitioned) NLMS
+  adaptive filter subtracts the speaker output from the mic during playback. The
+  TTS being played is captured as a reference (`ReferenceBuffer`) and the echo
+  canceller removes it from the mic before the barge-in wake-word check — so
+  barge-in works on **open speakers**, not just headphones.
+
+Startup prints `Noise suppression: enabled (RNNoise).` and `Echo cancellation:
+enabled …`. Tune via `DspConfig`: `enable_noise_suppression`,
+`enable_echo_cancellation`, `aec_filter_blocks` (echo tail length), `aec_mu`
+(adaptation speed), and **`aec_ref_delay_ms`** — raise this if echo isn't being
+removed, since the right value depends on your machine's audio output+input
+latency. AEC is a from-scratch numpy filter (no Windows AEC library builds), so
+treat it as effective-but-tunable; it reaches ~12–16 dB echo reduction on
+synthetic tests.
+
+### Text input (press F1)
+
+Don't want to talk? **Press F1 to toggle into text mode.** In text mode Atlas
+**stops listening** (the mic isn't read at all) and you type commands at the
+`text>` prompt — each runs through the exact same pipeline (LLM, tools, memory)
+as a spoken one, and the reply is still spoken and printed. You stay in text mode
+for as many commands as you like; **press F1 again to return to voice**. A
+watcher polls the key globally (Windows `GetAsyncKeyState`, no extra dependency),
+so the toggle works whether or not the terminal is focused. Typed turns skip the
+speaker gate (you're already at the keyboard). Toggle the whole feature with
+`enable_text_input` / change the key with `text_input_vk` in `config.py`.
+
 ### Barge-in
 
 While Atlas speaks, saying the wake word interrupts it and starts a new command.
-Assumes headphones — on open speakers Atlas's own voice can false-trigger it;
-disable with `allow_barge_in = False`.
+With echo cancellation on (above) this works on open speakers; with it off it
+assumes headphones, since Atlas's own voice can otherwise false-trigger it.
+Disable barge-in entirely with `allow_barge_in = False`.
 
 ### Wake word
 
@@ -729,11 +955,13 @@ Everything tunable lives in `config.py` (dataclasses):
 
 | Dataclass | What it controls |
 | --- | --- |
-| `Config` | Sample rate, VAD/silence timing, wake model + threshold, speaker threshold and `require_speaker_match`, STT model/device/language, follow-up window. |
+| `Config` | Sample rate, VAD/silence timing, wake model + threshold, speaker threshold and `require_speaker_match`, STT model/device/language, follow-up window, `enable_text_input` / `text_input_vk` (F1 typed input), `startup_phrase` (spoken greeting). |
 | `LLMConfig` | Model path, `n_gpu_layers`, context size, system prompt, `disable_thinking` (Qwen3 `/no_think`), `enable_tools`, `max_tool_rounds`. |
 | `TTSConfig` | Piper voice paths, output sample rate, `default_lang`, `voices` map. |
 | `PlaybackConfig` | `allow_barge_in`. |
-| `ToolsConfig` | `web_search_backend`, Tavily credentials, `enable_system_control`, `allow_power_off`, `enable_coding`, `command_timeout`. |
+| `DspConfig` | `enable_noise_suppression` (RNNoise), `enable_echo_cancellation`, `aec_filter_blocks`, `aec_mu`, `aec_ref_delay_ms`. |
+| `ToolsConfig` | `web_search_backend`, Tavily credentials, `enable_system_control`, `allow_power_off`, `enable_coding`, `command_timeout`, `enable_self_extend`, `plugins_dir`. |
+| `CodeAgentConfig` | `enable_code_agent`, `crew_venv`, `runner`, `timeout`, `output_dir`, `agent_role`/`agent_goal`/`agent_backstory`, `model` (`ATLAS_CREW_MODEL`, Gemini). |
 | `AgentsConfig` | `enable_agents`, `max_iterations`, `confirm_risky`, `risky_tools`, the ReAct system prompt. |
 | `MemoryConfig` | `enable_memory`, `recall_k`, `score_threshold`, store path. |
 | `StateConfig` | `enable_state`, `load_recent`, Postgres DSN (from `ATLAS_PG_DSN`). |
@@ -741,10 +969,11 @@ Everything tunable lives in `config.py` (dataclasses):
 | `RAGConfig` | `docs_dir`, `auto_ingest`, `chunk_chars`, `top_k`, `score_threshold`. |
 | `VisionConfig` | `enable_vision`, model + mmproj paths, `n_gpu_layers`, `max_image_px`, `ground_image_px`. |
 | `FaceConfig` | `enable_faces`, `model_pack`, `db_path`, `match_threshold`, `min_det_score`, `det_size`. |
-| `AuthConfig` | `require_identity` (face+voice startup gate), `owner_name`, `face_shots`, `voice_samples`, `voice_seconds`, `auth_attempts`. |
+| `AuthConfig` | `require_identity` (password+face+voice startup gate), `test_mode` (`ATLAS_TEST_MODE` in `.env` — skip all auth), `require_password`, `password_path`, `owner_name`, `face_shots`, `voice_samples`, `voice_seconds`, `auth_attempts`. |
 
 Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
-`ATLAS_REDIS_URL`) go in a gitignored **`.env`** in the project root.
+`ATLAS_REDIS_URL`) go in a gitignored **`.env`** in the project root, along with
+`ATLAS_TEST_MODE` (the dev bypass for the identity gate, default off).
 
 ---
 
@@ -762,10 +991,12 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
 - Face recognition stores **biometric data** (face embeddings) in `faces.npz`,
   kept local and gitignored. It is personalization, not security (a photo can
   fool it).
+- The startup password is stored only as a salted **PBKDF2-SHA256 hash**
+  (`auth_secret.dat`) — never in plaintext — and is gitignored.
 - Stored data stays on your machine: `qdrant_data/` (memory), the local Postgres
   DB (transcript), `docs/` and `qdrant_docs/` (your documents + index),
-  `voiceprint.npy`, `faces.npz`, `screenshots/`, and `photos/`. Delete any of
-  them to wipe that data.
+  `voiceprint.npy`, `faces.npz`, `auth_secret.dat`, `screenshots/`, and
+  `photos/`. Delete any of them to wipe that data.
 - One-time, on first run only: model downloads (wake word, ECAPA-TDNN, Whisper,
   and any you fetch manually).
 
@@ -795,16 +1026,21 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
 | `main.py` | Wires everything together; the per-turn loop. |
 | `config.py` | All configuration dataclasses. |
 | `audio_input.py` | Wake word + VAD recording. |
+| `audio_dsp.py` | RNNoise noise suppression + echo cancellation (mic DSP). |
 | `speaker_id.py` | ECAPA-TDNN speaker verification. |
 | `enroll.py` | One-time voiceprint enrollment. |
 | `stt.py` | faster-whisper transcription. |
 | `llm.py` | Qwen3 brain, tool loop, context building. |
 | `agents.py` | ReAct task agent + risk confirmation. |
-| `tools.py` | Tool registry + JSON protocol. |
+| `tools.py` | Tool registry + JSON protocol + self-extension (plugins). |
+| `code_agent.py` / `crew_runner.py` / `setup_crew.py` | CrewAI coding agent: subprocess bridge + isolated-venv runner + setup. |
+| `plugins/` | Custom tools Atlas wrote for itself (auto-loaded at startup). |
 | `system_control.py` | OS actions (volume, media, apps, input, power). |
 | `vision.py` | Local screen vision (Qwen2.5-VL) + webcam capture. |
+| `meeting.py` | Background meeting recorder (mic) for transcription. |
 | `face_id.py` / `enroll_face.py` | Face recognition (InsightFace) + enrollment. |
-| `auth.py` | Startup identity gate (face + voice onboarding/login). |
+| `face_window.py` | Live face-recognition webcam window (boxes + names). |
+| `auth.py` | Startup identity gate (password + face + voice onboarding/login). |
 | `tts.py` | Piper text-to-speech. |
 | `playback.py` | Streaming audio playback. |
 | `memory.py` | Semantic memory (Qdrant + fastembed). |

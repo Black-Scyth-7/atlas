@@ -110,6 +110,65 @@ class Memory:
             print(f"[memory] recall failed ({e})")
             return []
 
+    def note(self, text: str) -> bool:
+        """Store something the user explicitly asked Atlas to remember.
+
+        Notes are kept apart from ordinary exchanges and are *always* surfaced
+        into context (see notes()), so directives like "always answer briefly"
+        or facts like "call me Boss" reliably stick instead of only being
+        recalled when a turn happens to be similar.
+        """
+        if not self.enabled or not text.strip():
+            return False
+        self.remember(text.strip(), kind="note")
+        return True
+
+    def notes(self, limit: int = 25) -> List[str]:
+        """Return recent explicit notes (oldest-first), for always-on injection."""
+        if not self.enabled:
+            return []
+        try:
+            from qdrant_client.models import (FieldCondition, Filter,
+                                              MatchValue)
+            points, _ = self._client.scroll(
+                self.cfg.collection,
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="kind", match=MatchValue(value="note"))]),
+                limit=500, with_payload=True,
+            )
+            ordered = sorted(points, key=lambda p: p.payload.get("ts", 0))
+            return [p.payload["text"] for p in ordered[-limit:]]
+        except Exception as e:
+            print(f"[memory] notes failed ({e})")
+            return []
+
+    def forget(self, text: str, min_score: float = 0.60) -> Optional[str]:
+        """Delete the note most similar to `text`. Returns the deleted text.
+
+        The threshold is deliberately high (bge-small cosine: real matches land
+        ~0.64+, unrelated queries ~0.5) so it won't delete the wrong note.
+        """
+        if not self.enabled or not text.strip():
+            return None
+        try:
+            from qdrant_client.models import (FieldCondition, Filter,
+                                              MatchValue)
+            hits = self._client.query_points(
+                self.cfg.collection,
+                query=self._vector(text),
+                query_filter=Filter(must=[FieldCondition(
+                    key="kind", match=MatchValue(value="note"))]),
+                limit=1, with_payload=True,
+            ).points
+            if not hits or hits[0].score < min_score:
+                return None
+            self._client.delete(self.cfg.collection,
+                                points_selector=[hits[0].id])
+            return hits[0].payload.get("text", "")
+        except Exception as e:
+            print(f"[memory] forget failed ({e})")
+            return None
+
     def count(self) -> int:
         """Number of stored memories (0 if disabled)."""
         if not self.enabled:
@@ -120,17 +179,17 @@ class Memory:
             return 0
 
     def reset(self) -> bool:
-        """Delete every stored memory (drop + recreate the collection)."""
+        """Delete every stored memory. Deletes all points (an empty filter
+        matches everything) rather than dropping the collection — in Qdrant's
+        embedded/local mode, drop+recreate leaves the on-disk points behind."""
         if not self.enabled:
             return False
         try:
-            from qdrant_client.models import Distance, VectorParams
+            from qdrant_client import models
 
-            dim = len(self._vector("probe"))
-            self._client.delete_collection(self.cfg.collection)
-            self._client.create_collection(
+            self._client.delete(
                 self.cfg.collection,
-                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                points_selector=models.FilterSelector(filter=models.Filter()),
             )
             return True
         except Exception as e:

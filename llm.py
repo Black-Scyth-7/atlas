@@ -61,6 +61,7 @@ class LLM:
         self.store = store    # optional durable state (see state.py)
         self.docs = docs      # optional RAG document store (see rag.py)
         self._turn_memory = ""  # transient recalled context for the current turn
+        self._user_identity = None  # (name, role) of the current user; see main.py
         self.llm = Llama(
             model_path=cfg.model_path,
             n_gpu_layers=cfg.n_gpu_layers,
@@ -127,11 +128,34 @@ class LLM:
         )
         return strip_think(resp["choices"][0]["message"].get("content") or "")
 
+    def set_user_identity(self, name, role) -> None:
+        """Tell the model who it's talking to (from the startup identity gate /
+        registry) so it can answer 'who am I' about the USER, not itself."""
+        self._user_identity = (name, role) if name else None
+
     def build_turn_context(self, user_text: str) -> str:
-        """Shared per-turn context: recalled memories + relevant document
-        passages (both similarity-gated). Empty string if nothing relevant."""
+        """Shared per-turn context: who the user is + recalled memories +
+        relevant document passages. Empty string if nothing relevant."""
         parts: list[str] = []
+        if self._user_identity and self._user_identity[0]:
+            name, role = self._user_identity
+            ident = f"The person you are talking to is {name}"
+            if role:
+                ident += f" (authority level: {role})"
+            ident += ('. If they ask "who am I", their name, or their '
+                      "authority/role, they mean THEMSELVES — answer with this, "
+                      "not a description of yourself.")
+            parts.append(ident)
         if self.memory is not None:
+            # Explicit notes the user asked Atlas to remember — always applied
+            # (not similarity-gated), so standing preferences/corrections stick.
+            notes = self.memory.notes()
+            if notes:
+                parts.append(
+                    "Standing instructions and facts the user told you to "
+                    "remember (always honor these):\n"
+                    + "\n".join(f"- {n}" for n in notes)
+                )
             recalled = self.memory.recall(user_text)
             if recalled:
                 parts.append(
@@ -289,6 +313,15 @@ class LLM:
         keep = self.cfg.keep_turns
         if len(self.history) > keep * 2 + 1:
             self.history = [self.history[0]] + self.history[-keep * 2:]
+
+    def reset_session(self) -> None:
+        """Forget the live in-RAM conversation (used by reset_all, so a reset
+        also wipes what was said this session, not just the persistent stores)."""
+        self.history = [self.history[0]]   # keep only the system prompt
+        self._turn_memory = ""
+        if self.orchestrator is not None:
+            self.orchestrator._pending = None
+            self.orchestrator._confirmed = None
 
 
 if __name__ == "__main__":

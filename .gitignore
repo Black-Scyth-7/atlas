@@ -17,7 +17,12 @@ docs/
 
 # Python
 .venv/
+.venv-crew/
+.venv-train/
 __pycache__/
+
+# CrewAI coding-agent outputs
+crew_output/
 *.pyc
 
 # Scratch audio
@@ -27,10 +32,24 @@ __pycache__/
 screenshots/
 photos/
 
+# Meeting recordings/notes
+meetings/
+
 # Enrolled face embeddings (biometric data — keep local)
 faces.npz
+
+# Startup password hash (keep local)
+auth_secret.dat
 
 # Wake-word training artifacts (~18GB: clips, 17GB negatives, features)
 wake_training/
 
 .vscode/
+# face window crash log
+face_window.log
+
+# registered users (names + authority)
+users.json
+
+# per-user voiceprints
+voiceprints/

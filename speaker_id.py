@@ -53,12 +53,12 @@ class SpeakerVerifier:
         centroid = F.normalize(embs.mean(dim=0), dim=0)
         return centroid.cpu().numpy()
 
-    def save_voiceprint(self, voiceprint: np.ndarray) -> None:
-        np.save(self.cfg.voiceprint_path, voiceprint)
+    def save_voiceprint(self, voiceprint: np.ndarray, path: str = "") -> None:
+        np.save(path or self.cfg.voiceprint_path, voiceprint)
 
-    def load_voiceprint(self) -> torch.Tensor:
-        """Load the enrolled voiceprint. Raises FileNotFoundError if missing."""
-        arr = np.load(self.cfg.voiceprint_path)
+    def load_voiceprint(self, path: str = "") -> torch.Tensor:
+        """Load a voiceprint (default = the owner's). Raises if missing."""
+        arr = np.load(path or self.cfg.voiceprint_path)
         return torch.tensor(arr, dtype=torch.float32)
 
     def verify(self, audio: np.ndarray, voiceprint: torch.Tensor) -> tuple[bool, float]:

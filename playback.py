@@ -32,6 +32,7 @@ def play_stream(
     chunks: Iterable[np.ndarray],
     sample_rate: int,
     stop_event: Optional[threading.Event] = None,
+    reference_sink=None,
 ) -> None:
     """Play chunks as they become available; overlap production with playback.
 
@@ -39,6 +40,9 @@ def play_stream(
     sentences) and fed through a small queue to the output stream, so audio
     starts as soon as the first chunk is ready. If `stop_event` is set, playback
     halts at the next chunk boundary (barge-in).
+
+    `reference_sink`, if given, receives every chunk written to the speaker (via
+    `.push(chunk, sample_rate)`) so the echo canceller has a reference signal.
     """
     q: "queue.Queue[object]" = queue.Queue(maxsize=8)
 
@@ -65,8 +69,19 @@ def play_stream(
                 break
             chunk: np.ndarray = item  # type: ignore[assignment]
             if chunk.size:
+                if reference_sink is not None:
+                    reference_sink.push(chunk, sample_rate)
                 stream.write(chunk)
     finally:
+        # On a clean finish (not a barge-in stop), write a little trailing
+        # silence so the last samples of the final sentence aren't clipped when
+        # the output stream stops.
+        if stop_event is None or not stop_event.is_set():
+            try:
+                pad = np.zeros(int(sample_rate * 0.15), dtype="float32")
+                stream.write(pad)
+            except Exception:
+                pass
         stream.stop()
         stream.close()
 
