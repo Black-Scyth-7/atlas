@@ -24,22 +24,38 @@ class Config:
     # --- Audio I/O (one shared 16 kHz mono InputStream for the whole app) ---
     sample_rate: int = 16000        # shared by wake word, VAD, STT, and speaker ID
     frame_ms: int = 30              # webrtcvad frame size (must be 10, 20, or 30)
-    wake_chunk: int = 1280          # openWakeWord expects 80 ms chunks (1280 samples)
+    wake_chunk: int = 1280          # fed to the detector in 80 ms chunks (1280 samples)
 
-    # --- Wake word (openWakeWord) ---
-    # Custom "Atlas" model trained locally (see wake_training/). To revert to a
-    # bundled phrase, set this to "hey_jarvis". Single-word wake words are the
-    # hardest case, so tune wake_threshold against your mic/environment.
+    # --- Wake word (custom PyTorch MatchboxNet; see wake_pytorch/) ---
+    # "Atlas" detector trained locally with wake_pytorch/train.py and exported to
+    # ONNX. The runtime WakeDetector (wake_pytorch/detector.py) runs it via
+    # onnxruntime over a rolling 1.5 s mic window. Single-word wake words are the
+    # hardest case, so tune wake_threshold against your mic/environment (see
+    # wake_pytorch/eval.py for a recall-vs-false-wakes/hour sweep).
     wake_model: str = "models/atlas.onnx"
-    wake_framework: str = "onnx"    # "onnx" (reliable on Windows) or "tflite"
-    wake_threshold: float = 0.5     # raise to reduce false triggers
-    # The model's internal buffers fill over the first ~1 s after a reset and can
-    # spike spuriously (e.g. it scores 0.77 on pure silence); ignore detections
-    # during this warm-up of 80 ms chunks so Atlas doesn't wake itself at startup.
+    # 0.75: your enrolled voice scores >=0.998 on "Atlas" (huge margin) while the
+    # hardest sound-alike in your own speech peaks ~0.63, so this cleanly rejects
+    # your chatter with zero recall cost. Lower toward 0.5 if a quiet/far "Atlas"
+    # ever gets missed on a live mic; raise to reduce false triggers further.
+    wake_threshold: float = 0.75
+    # The detector's rolling window fills over the first ~1.5 s after a reset, so
+    # early scores see mostly zero-padded audio; ignore detections during this
+    # warm-up of 80 ms chunks so Atlas doesn't wake itself at startup.
     wake_warmup_chunks: int = 12
     # Require this many CONSECUTIVE over-threshold chunks to fire. A real "atlas"
     # spans several chunks; a lone spike from silence/transient noise doesn't.
-    wake_consecutive: int = 2
+    wake_consecutive: int = 3
+    # --- Barge-in wake detection (interrupt mid-reply) ---
+    # Detecting "atlas" WHILE Atlas is speaking is harder than from idle: your
+    # voice competes with Atlas's own (partially echo-cancelled) voice in the mic.
+    # So barge-in gets its OWN, more sensitive settings, decoupled from the strict
+    # idle thresholds above (a missed barge-in is worse than a rare early stop).
+    # A shorter warm-up also shrinks the ~1 s dead-zone at the start of each reply.
+    bargein_threshold: float = 0.5      # lower than wake_threshold (more sensitive)
+    bargein_consecutive: int = 2        # fewer consecutive chunks than wake
+    bargein_warmup_chunks: int = 4      # shorter dead-zone at reply start
+    # Set env ATLAS_BARGEIN_DEBUG=1 to print live barge-in scores while Atlas
+    # speaks, so you can tune bargein_threshold to your mic/echo.
 
     # --- Recording / voice activity detection (webrtcvad) ---
     silence_tail_ms: int = 800      # stop after this much trailing silence
@@ -65,6 +81,12 @@ class Config:
     # Spoken aloud once Atlas finishes loading and is ready. "" = silent start.
     startup_phrase: str = "Atlas is online and ready."
 
+    # --- Shutdown phrase ---
+    # Spoken aloud (guaranteed, by main.py — not the LLM) when Atlas is asked to
+    # shut itself down via the shutdown_self tool, so you always hear it before
+    # the program exits. "" = exit silently.
+    shutdown_phrase: str = "Goodbye."
+
     # --- "Didn't get it" phrase ---
     # Spoken when Atlas wakes but hears nothing / can't transcribe the command,
     # so you get feedback instead of silence. "" = stay silent.
@@ -80,11 +102,54 @@ class Config:
     speaker_threshold: float = 0.30  # cosine similarity cutoff; tune per-mic
     require_speaker_match: bool = True  # set False to disable the gate entirely
 
-    # --- Speech-to-text (faster-whisper, CPU) ---
-    stt_model: str = "small"        # tiny / base / small / medium / large-v3
-    stt_device: str = "cpu"         # spec: run STT on CPU
-    stt_compute_type: str = "int8"  # "int8" on CPU, "float16" on GPU
+    # --- Speech-to-text (faster-whisper, GPU) ---
+    stt_model: str = "medium"        # tiny / base / small / medium / large-v3
+    stt_device: str = "cuda"        # "cuda" (GPU, fp16) or "cpu" (int8)
+    stt_compute_type: str = "float16"  # "float16" on GPU, "int8" on CPU
     stt_language: str = "en"        # English only ("" would auto-detect any language)
+    # GPU 'small' fp16 is fast (~0.7 s) and leaves ~1.4 GB VRAM free alongside the
+    # resident 8B LLM (measured). beam_size>1 weighs alternatives (better proper
+    # nouns); the initial_prompt biases decoding toward these brand/app spellings
+    # so e.g. "GitHub" isn't heard as "gate hub". stt.py falls back to CPU int8 if
+    # the GPU load fails. Needs the nvidia-*-cu12 CUDA libs (see requirements.txt).
+    stt_beam_size: int = 5
+    stt_initial_prompt: str = (
+        "GitHub, YouTube, Spotify, Atlas, VS Code, Chrome, Edge, Notepad, "
+        "Gmail, WhatsApp, Reddit, LinkedIn, Discord, Google, ChatGPT."
+    )
+    # --- Anti-hallucination guards (Whisper invents text on silence/noise) ---
+    # vad_filter runs faster-whisper's built-in Silero VAD to strip non-speech
+    # before decoding — the single most effective guard. The thresholds make
+    # Whisper mark low-confidence / silent regions as no-speech so they're
+    # dropped instead of turned into phantom words (e.g. an echo of the brand
+    # names in stt_initial_prompt, or repeated "thank you"). Loosen only if real
+    # speech is being cut: lower no_speech_threshold, or set stt_vad_filter False.
+    stt_vad_filter: bool = True
+    stt_no_speech_threshold: float = 0.6      # >this no_speech_prob => treat as silence
+    stt_log_prob_threshold: float = -1.0      # avg_logprob below => low-confidence
+    stt_compression_ratio_threshold: float = 2.4  # >this => repetitive gibberish
+    # Reject near-silent clips (a breath, a click, room noise that slips past the
+    # webrtcvad recorder) before decoding — those are what Whisper turns into
+    # confident caption phrases. Real speech is rms ~0.05-0.2; measured a
+    # hallucinating clip at 0.017. 0.02 is a safe floor; lower it (e.g. 0.01) if a
+    # genuinely soft command is ever rejected, or 0.0 to disable this check.
+    stt_min_rms: float = 0.02
+    # Whisper was trained on YouTube captions, so on short/low-content audio it
+    # emits caption-style phrases ("thanks for watching", "bye", "that's all
+    # there is to it"). A transcript whose EVERY sentence matches one of these
+    # (case/punctuation/apostrophe-insensitive) is dropped as a hallucination.
+    # Whole-phrase match only: "thank you atlas" or "bye atlas" still get through
+    # since they carry extra words. Add any new phantom phrases you observe.
+    stt_hallucination_phrases: tuple = (
+        "you", "thank you", "thanks", "thank you very much", "thank you so much",
+        "thanks for watching", "thank you for watching", "thanks for listening",
+        "please subscribe", "like and subscribe", "dont forget to subscribe",
+        "subscribe to my channel", "see you next time", "see you in the next video",
+        "ill see you next time", "see you", "bye", "bye bye", "goodbye",
+        "okay", "ok", "yeah", "yep", "so", "um", "uh", "hmm", "mm hmm",
+        "thats it", "and thats it", "thats all", "thats all there is to it",
+        "yep thats all there is to it", "have a great day", "the end", "alright",
+    )
 
     @property
     def frame_samples(self) -> int:
@@ -152,7 +217,7 @@ class ToolsConfig:
     # gates shutdown/restart specifically — off by default so a misheard command
     # can't power down the machine (lock/sleep stay available).
     enable_system_control: bool = True
-    allow_power_off: bool = False
+    allow_power_off: bool = True
 
     # Coding tools: read/write/edit files and run commands (write_file, read_file,
     # edit_file, list_dir, run_command). run_command and overwriting an existing
@@ -325,7 +390,7 @@ class DspConfig:
 
     # Noise suppression (RNNoise) on the captured mic audio — helps the wake
     # word, VAD, and STT work in a noisy room.
-    enable_noise_suppression: bool = True
+    enable_noise_suppression: bool = False
 
     # Acoustic echo cancellation during playback, so Atlas's own voice coming
     # out of the speakers doesn't false-trigger the wake word (barge-in without
@@ -345,6 +410,10 @@ class PlaybackConfig:
     # When True, Atlas listens for the wake word while speaking and stops
     # talking if it hears you (barge-in). See playback.py / main.py for the hook.
     allow_barge_in: bool = True
+    # Trailing silence (ms) written after the last sentence, plus a matching
+    # wait, so the end of a reply isn't clipped when the output stream stops.
+    # Raise this if you still hear the last word cut off.
+    tail_padding_ms: int = 450
 
 
 @dataclass

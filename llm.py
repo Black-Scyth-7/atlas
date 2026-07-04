@@ -14,10 +14,22 @@ Run this file directly for a standalone Step 4/6 test (typed prompts):
 """
 
 import datetime
+import os
 import re
+import time
 from typing import Iterator
 
 from llama_cpp import Llama
+
+# Opt-in per-stage timing (ATLAS_TIMING=1). Off by default; prints where each
+# turn's seconds go so latency can be diagnosed without a profiler.
+_TIMING = bool(os.environ.get("ATLAS_TIMING"))
+
+
+def _lap(label: str, t0: float) -> float:
+    if _TIMING:
+        print(f"  [t] {label}: {time.perf_counter() - t0:.2f}s", flush=True)
+    return time.perf_counter()
 
 from config import LLMConfig
 
@@ -166,8 +178,13 @@ class LLM:
             passages = self.docs.search(user_text)
             if passages:
                 parts.append(
-                    "Relevant excerpts from the user's own documents (cite the "
-                    "source file if useful):\n"
+                    "Possibly-relevant excerpts from the user's own documents "
+                    "(they may or may not relate to the question — use them only "
+                    "if they actually answer it, and cite the source file if you "
+                    "do). If they do NOT contain the answer, do NOT reply that the "
+                    "information isn't in the text; instead use web_search (for "
+                    "prices, products, current facts) or answer from your own "
+                    "knowledge:\n"
                     + "\n".join(f"[{src}] {txt}" for txt, src in passages)
                 )
         return "\n\n".join(parts)
@@ -225,8 +242,11 @@ class LLM:
         # Agent: iterative ReAct task loop (act -> observe -> repeat) on this
         # same model; pauses for spoken confirmation before risky actions.
         if self.orchestrator is not None:
+            _t = time.perf_counter()
             context = self.build_turn_context(user_text)
+            _t = _lap("build_context (memory recall + RAG)", _t)
             answer = self.orchestrator.handle(user_text, context)
+            _lap("agent.handle (ReAct LLM loop + tools)", _t)
             self.history.append({"role": "user", "content": user_text})
             self.history.append({"role": "assistant", "content": answer})
             self._trim_history()
@@ -257,8 +277,13 @@ class LLM:
             passages = self.docs.search(user_text)
             if passages:
                 context_parts.append(
-                    "Relevant excerpts from the user's own documents (cite the "
-                    "source file if useful):\n"
+                    "Possibly-relevant excerpts from the user's own documents "
+                    "(they may or may not relate to the question — use them only "
+                    "if they actually answer it, and cite the source file if you "
+                    "do). If they do NOT contain the answer, do NOT reply that the "
+                    "information isn't in the text; instead use web_search (for "
+                    "prices, products, current facts) or answer from your own "
+                    "knowledge:\n"
                     + "\n".join(f"[{source}] {text}" for text, source in passages)
                 )
         self._turn_memory = "\n\n".join(context_parts)

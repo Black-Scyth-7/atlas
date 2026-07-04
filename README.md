@@ -69,8 +69,8 @@ running without it.
 
 ### Per-turn pipeline
 
-1. **Wake word** — an always-on mic listens for *"Atlas"* (openWakeWord, a custom
-   locally-trained model: `models/atlas.onnx`).
+1. **Wake word** — an always-on mic listens for *"Atlas"* (a custom
+   locally-trained MatchboxNet model: `models/atlas.onnx`, run via onnxruntime).
 2. **Record** — captures audio until you stop talking (webrtcvad voice-activity
    detection).
 3. **Speaker gate** — verifies the clip sounds like the enrolled owner
@@ -122,7 +122,7 @@ daemons are required for the core pipeline.
 
 | Stage | Technology | Notes |
 | --- | --- | --- |
-| Wake word | **openWakeWord** (ONNX runtime) | Custom locally-trained "Atlas" model. |
+| Wake word | **MatchboxNet** (PyTorch → ONNX runtime) | Custom locally-trained "Atlas" model; see `wake_pytorch/`. |
 | Recording | **webrtcvad** + **sounddevice** (PortAudio) | Voice-activity detection trims silence. |
 | Audio cleanup | **RNNoise** (noise suppression) + numpy frequency-domain **AEC** | Denoise the mic; cancel the speaker echo. |
 | Speaker gate | **SpeechBrain** ECAPA-TDNN (PyTorch, CPU) | Cosine-similarity voiceprint match. |
@@ -245,8 +245,9 @@ python speaker_id.py        # test voice accept/reject scoring
 Tune `speaker_threshold` (voice) and `FaceConfig.match_threshold` (face) in
 `config.py`, or set `AuthConfig.require_identity = False` to skip the gate.
 
-> First runs download the openWakeWord, ECAPA-TDNN, and Whisper models (internet
-> needed once); afterwards the core AI pipeline is fully offline.
+> First runs download the ECAPA-TDNN and Whisper models (internet needed once);
+> the wake-word model is a local file (`models/atlas.onnx`) and needs no download.
+> Afterwards the core AI pipeline is fully offline.
 
 The startup banner reports the status of every subsystem, e.g.:
 
@@ -886,9 +887,9 @@ can't load, that stage passes audio through and Atlas keeps working.
   **RNNoise** (a small recurrent denoiser, run at its native 48 kHz and
   resampled around our 16 kHz pipeline), so voice-activity detection and
   transcription hold up in a **noisy room**. The **wake word runs on raw audio**
-  — the openWakeWord model is trained on raw mic input (with noise augmentation),
-  and denoising shifts the signal enough to hurt detection, so it's applied
-  downstream only. RNNoise ships as a tiny bundled DLL inside `pyrnnoise`; Atlas
+  — the MatchboxNet model is trained on raw mic input (with MUSAN noise
+  augmentation), and denoising shifts the signal enough to hurt detection, so it's
+  applied downstream only. RNNoise ships as a tiny bundled DLL inside `pyrnnoise`; Atlas
   loads that low-level binding directly (sidestepping the package's heavy PyAV
   dependency).
 - **Acoustic echo cancellation (AEC).** So Atlas doesn't **trigger on its own
@@ -929,13 +930,35 @@ Disable barge-in entirely with `allow_barge_in = False`.
 ### Wake word
 
 `Config.wake_model` points at **`models/atlas.onnx`** — a custom single-word
-"Atlas" model trained locally with openWakeWord (pipeline in
-`wake_training/train_atlas.py`: ~20k LibriTTS-generated positives + the
-precomputed negative feature set, file-free augmentation, CPU). Set it back to a
-bundled phrase like `"hey_jarvis"` (and `wake_framework`) to change it — nothing
-else changes. Single short words false-trigger more easily, so tune
-`wake_threshold` to your mic (synthetic validation: silence ~0.09, a real "atlas"
-clip ~0.998).
+"Atlas" detector trained **from scratch in PyTorch** with the
+[**MatchboxNet**](https://arxiv.org/abs/2004.08531) architecture (1D
+time-channel separable conv ResNet, ~89k params). The full training pipeline
+lives in **`wake_pytorch/`** and has no openWakeWord dependency:
+
+- **Features** — 64 MFCC @ 16 kHz (25 ms / 10 ms), defined once in
+  `wake_pytorch/features.py` and imported by *both* training and the runtime
+  detector so the front-end can never drift.
+- **Positives** — synthesized with **[Kokoro TTS](https://huggingface.co/hexgrad/Kokoro-82M)**
+  across ~28 English voices × prosody variants × speeds (`gen_positives.py`).
+- **Negatives + augmentation** — the **[MUSAN](https://www.openslr.org/17/)**
+  corpus (music / speech / noise): speech gives hard babble negatives, music and
+  noise are mixed into positives at 0–20 dB SNR, plus synthetic quiet/ambient
+  clips (`prepare_negatives.py`). SpecAugment + time-shift applied at train time.
+- **Runtime** — `wake_pytorch/detector.py` (`WakeDetector`) runs the exported
+  ONNX via onnxruntime over a rolling 1.5 s mic window, returning `P("Atlas")`.
+
+Retrain end-to-end (in the isolated GPU venv `wake_pytorch/.venv`):
+
+```powershell
+wake_pytorch\.venv\Scripts\python wake_pytorch\gen_positives.py       # Kokoro positives
+wake_pytorch\.venv\Scripts\python wake_pytorch\prepare_negatives.py   # MUSAN + quiet negs
+wake_pytorch\.venv\Scripts\python wake_pytorch\train.py               # -> checkpoints/
+wake_pytorch\.venv\Scripts\python wake_pytorch\eval.py                # threshold sweep
+wake_pytorch\.venv\Scripts\python wake_pytorch\export_onnx.py         # -> models/atlas.onnx
+```
+
+Single short words false-trigger more easily, so tune `wake_threshold` to your
+mic — `eval.py` sweeps it and reports recall vs false-wakes/hour.
 
 ### Language (English-only)
 
@@ -997,8 +1020,8 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
   DB (transcript), `docs/` and `qdrant_docs/` (your documents + index),
   `voiceprint.npy`, `faces.npz`, `auth_secret.dat`, `screenshots/`, and
   `photos/`. Delete any of them to wipe that data.
-- One-time, on first run only: model downloads (wake word, ECAPA-TDNN, Whisper,
-  and any you fetch manually).
+- One-time, on first run only: model downloads (ECAPA-TDNN, Whisper, and any you
+  fetch manually). The wake-word model is a local file — no download.
 
 ---
 
@@ -1048,4 +1071,4 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
 | `cache.py` | Cache (Redis/Memurai). |
 | `rag.py` / `ingest.py` | Document RAG + manual ingestion. |
 | `setup_gpu.py` | Copies CUDA DLLs for the GPU build. |
-| `wake_training/` | Local "Atlas" wake-word training pipeline. |
+| `wake_pytorch/` | Local "Atlas" wake-word training pipeline (MatchboxNet, Kokoro positives, MUSAN negatives) + runtime detector. |
