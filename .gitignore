@@ -41,8 +41,16 @@ faces.npz
 # Startup password hash (keep local)
 auth_secret.dat
 
-# Wake-word training artifacts (~18GB: clips, 17GB negatives, features)
-wake_training/
+# Wake-word training (PyTorch): GPU venv + data/features/model artifacts.
+# Source scripts in wake_pytorch/ ARE tracked; only the heavy outputs are ignored.
+wake_pytorch/.venv/
+wake_pytorch/data/
+wake_pytorch/features/
+wake_pytorch/checkpoints/
+wake_pytorch/*.pt
+wake_pytorch/*.onnx
+# ...except the exported runtime wake-word model, which ships in-repo.
+!wake_pytorch/atlas.onnx
 
 .vscode/
 # face window crash log
@@ -53,3 +61,6 @@ users.json
 
 # per-user voiceprints
 voiceprints/
+
+# sample-generation venv (GPU torch + piper)
+.venv-gen/

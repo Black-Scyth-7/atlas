@@ -534,6 +534,13 @@ def close_app(name: str) -> str:
     result = subprocess.run(["taskkill", "/IM", img], capture_output=True, text=True)
     if result.returncode == 0:
         return f"Closed {key}."
+    # Not a running process. It may be a site/page open in a browser TAB (e.g.
+    # "close GitHub" after open_website opened github.com) — the name won't look
+    # domain-like, so it skipped the _SITE_RE path above. Fall back to closing a
+    # browser window whose title contains the name (denylisted/unsafe names have
+    # already returned above, so this only runs for ordinary requests).
+    if _close_browser_windows(key):
+        return f"Closed the browser window showing {key}."
     return f"{key} doesn't appear to be running."
 
 

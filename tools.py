@@ -88,6 +88,18 @@ _COIN_IDS = {
     "usdc": "usd-coin", "bch": "bitcoin-cash", "xmr": "monero", "atom": "cosmos",
 }
 
+# WMO weather-interpretation codes -> plain English (for the Open-Meteo backend).
+_WMO_CODES = {
+    0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Foggy", 48: "Foggy", 51: "Light drizzle", 53: "Drizzle",
+    55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
+    61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain",
+    67: "Freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+    77: "Snow grains", 80: "Rain showers", 81: "Rain showers",
+    82: "Violent rain showers", 85: "Snow showers", 86: "Snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with hail",
+}
+
 # Unit -> (dimension, factor to the base unit). Temperature handled separately.
 _UNITS = {
     "m": ("len", 1.0), "meter": ("len", 1.0), "meters": ("len", 1.0),
@@ -201,6 +213,8 @@ class Tools:
         self._clear_session = None
         # reset_all sets this; main.py restarts the process after speaking.
         self.restart_requested = False
+        # shutdown_self sets this; main.py exits the program after speaking.
+        self.shutdown_requested = False
 
         # Login authority of the current session. Risky/system tools in
         # _admin_only are refused for non-admins. In test mode the gate is off
@@ -252,6 +266,17 @@ class Tools:
                 "history, the cache, the enrolled voice and face, and the "
                 "startup password. Irreversible. Only when the user clearly "
                 "asks to reset everything / reset yourself / wipe everything.",
+                "{}",
+            ),
+            "shutdown_self": (
+                self._shutdown_self,
+                "Shut YOURSELF (the Atlas ASSISTANT program) down and exit. Use "
+                "ONLY when the user targets Atlas itself: 'shut yourself down', "
+                "'shut down Atlas', 'turn yourself off', 'exit', 'quit', "
+                "'goodbye'. Do NOT use this when the user targets the MACHINE — "
+                "'shut down my laptop / computer / PC', 'turn off the computer', "
+                "'power off' — that is system_power, NOT this. This only closes "
+                "the Atlas program; it does NOT power off the computer.",
                 "{}",
             ),
             "register_user": (
@@ -473,8 +498,13 @@ class Tools:
                 ),
                 "system_power": (
                     self._system_power,
-                    "Lock, sleep, shut down, restart, or cancel a pending "
-                    "shutdown (shutdown/restart may be disabled).",
+                    "Control the physical COMPUTER's power: lock, sleep, shut "
+                    "down (power off), restart, or cancel a pending shutdown. Use "
+                    "this whenever the user targets the MACHINE/laptop/PC/desktop "
+                    "— 'shut down my laptop', 'turn off the computer', 'power off "
+                    "the PC', 'restart the computer', 'lock the screen', 'put the "
+                    "PC to sleep'. (shutdown/restart may be disabled by config, in "
+                    "which case it reports that.)",
                     '{"action": "lock"|"sleep"|"shutdown"|"restart"|"cancel"}',
                 ),
             })
@@ -914,6 +944,38 @@ class Tools:
 
     def _get_weather(self, args: dict) -> str:
         loc = str(args.get("location", "")).strip()
+        # With a named place, geocode it via Open-Meteo first — its geocoder is far
+        # more accurate than wttr.in's, which mislocates some major cities (e.g.
+        # "Tokyo" -> Shikinejima, an island 150 km away). No location -> wttr.in,
+        # which geolocates by IP for local weather. wttr.in is also the fallback.
+        if loc:
+            try:
+                geo = json.loads(self._http_get(
+                    "https://geocoding-api.open-meteo.com/v1/search?name="
+                    + quote_plus(loc) + "&count=1&language=en&format=json",
+                    timeout=12))
+                res = (geo.get("results") or [None])[0]
+                if res:
+                    lat, lon = res["latitude"], res["longitude"]
+                    label = ", ".join(p for p in (res.get("name", loc),
+                                                  res.get("country", "")) if p)
+                    data = json.loads(self._http_get(
+                        f"https://api.open-meteo.com/v1/forecast?latitude={lat}"
+                        f"&longitude={lon}&current=temperature_2m,"
+                        "apparent_temperature,relative_humidity_2m,"
+                        "wind_speed_10m,weather_code", timeout=12))
+                    cur = data["current"]
+                    desc = _WMO_CODES.get(int(cur.get("weather_code", -1)), "")
+                    return (f"{label}: {desc}, {round(cur['temperature_2m'])}°C "
+                            f"(feels {round(cur['apparent_temperature'])}°C), "
+                            f"humidity {round(cur['relative_humidity_2m'])}%, "
+                            f"wind {round(cur['wind_speed_10m'])} km/h.")
+            except Exception:
+                pass  # fall through to wttr.in
+        return self._weather_wttr(loc)
+
+    def _weather_wttr(self, loc: str) -> str:
+        """Fallback/IP-based weather via wttr.in."""
         url = "https://wttr.in/" + quote_plus(loc) + "?format=j1"
         try:
             data = json.loads(self._http_get(url, timeout=12))
@@ -1056,6 +1118,18 @@ class Tools:
         if not a or not b or a[0] != b[0]:
             return f"I can't convert '{frm}' to '{to}'."
         return f"{amt:g} {frm} = {amt * a[1] / b[1]:g} {to}"
+
+    def _shutdown_self(self, args: dict) -> str:
+        """Signal main.py to exit Atlas after this reply is spoken.
+
+        Only closes the assistant program — it does not power off the machine
+        (that's system_power). main.py checks `shutdown_requested` after each turn.
+        """
+        self.shutdown_requested = True
+        # Keep this observation terse and goodbye-free: main.py speaks the actual
+        # shutdown_phrase after this turn, so we don't want the LLM saying goodbye
+        # too (that would double it). A brief ack is fine.
+        return "Shutting down."
 
     def _reset_all(self, args: dict) -> str:
         """Factory reset: wipe memory, history, cache, voiceprint, and faces.

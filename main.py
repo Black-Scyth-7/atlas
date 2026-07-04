@@ -17,9 +17,20 @@ import os
 import re
 import sys
 import threading
+import time
 import warnings
 
 import numpy as np
+
+# Opt-in per-stage latency timing (set ATLAS_TIMING=1). Prints how long each
+# per-turn stage takes so a slow response can be traced to its stage.
+_TIMING = bool(os.environ.get("ATLAS_TIMING"))
+
+
+def _lap(label: str, t0: float) -> float:
+    if _TIMING:
+        print(f"  [t] {label}: {time.perf_counter() - t0:.2f}s", flush=True)
+    return time.perf_counter()
 
 # webrtcvad imports the deprecated `pkg_resources` at import time; silence that
 # specific (harmless) warning so startup output stays clean.
@@ -64,6 +75,27 @@ import playback
 # everything after stays buffered until the next boundary or end of stream.
 _SENTENCE_BOUNDARY = re.compile(r"^(.*?[.!?।॥]+)(\s+)(.*)$", re.DOTALL)
 
+# Explicit "shut Atlas down" intent, detected straight from the transcript so a
+# critical action doesn't depend on the LLM choosing to call the shutdown tool.
+# Every branch requires a self-reference (yourself / Atlas / the assistant / the
+# program) adjacent to the shutdown verb, so unrelated phrases like "turn off the
+# lights" or "shut the door" never match.
+# [\s,]+ separators tolerate a comma ("Atlas, shut down") from the transcript.
+_SELF_SHUTDOWN_RE = re.compile(
+    r"shut\s*(down|off)[\s,]+(your\s?self|atlas|the\s+(assistant|program|app))"  # shut down yourself
+    r"|shut[\s,]+(your\s?self|atlas)\s+(down|off)"                             # shut yourself down
+    r"|turn[\s,]+(your\s?self|atlas)\s+off"                                    # turn yourself off
+    r"|turn\s+off[\s,]+(your\s?self|atlas)"                                    # turn off atlas
+    r"|power\s+(down|off)[\s,]+(your\s?self|atlas)"                            # power off atlas
+    r"|(your\s?self|atlas)[\s,]+(shut\s*(down|off)|power\s+(down|off))"        # atlas, shut down
+    r"|(exit|quit|close)[\s,]+(your\s?self|atlas|the\s+(program|app|assistant))",  # exit atlas
+    re.IGNORECASE)
+
+
+def _is_self_shutdown(text: str) -> bool:
+    """True if the transcript is an explicit request to shut Atlas itself down."""
+    return bool(text and _SELF_SHUTDOWN_RE.search(text))
+
 
 def _flush_sentences(buffer: str) -> tuple[list[str], str]:
     """Split off any complete sentences, returning (sentences, remainder)."""
@@ -93,12 +125,19 @@ def _bargein_watcher(stream, oww, cfg: Config,
         aec.reset()
     if refbuf is not None:
         refbuf.clear()
-    # Same guards as wait_for_wake_word: skip the warm-up spike window and
-    # require consecutive over-threshold chunks. Without these, the model's
-    # spurious spikes (or Atlas's own leaking voice) falsely "barge in" and
-    # cut off the end of the sentence being spoken.
-    warmup = max(0, getattr(cfg, "wake_warmup_chunks", 0))
-    need = max(1, getattr(cfg, "wake_consecutive", 1))
+    # Barge-in uses its OWN, more sensitive detection settings (see Config): a
+    # lower threshold, fewer consecutive chunks, and a shorter warm-up than the
+    # strict idle wake, because your voice has to cut through Atlas's own
+    # (partially echo-cancelled) speech. Falls back to the wake settings if the
+    # barge-in ones aren't defined.
+    warmup = max(0, getattr(cfg, "bargein_warmup_chunks",
+                            getattr(cfg, "wake_warmup_chunks", 0)))
+    need = max(1, getattr(cfg, "bargein_consecutive",
+                          getattr(cfg, "wake_consecutive", 1)))
+    threshold = getattr(cfg, "bargein_threshold",
+                        getattr(cfg, "wake_threshold", 0.5))
+    debug = bool(os.environ.get("ATLAS_BARGEIN_DEBUG"))
+    peak = 0.0
     seen = 0
     run = 0
     buf = np.empty(0, dtype=np.int16)
@@ -113,19 +152,31 @@ def _bargein_watcher(stream, oww, cfg: Config,
         buf = np.concatenate([buf, pcm])
         while len(buf) >= cfg.wake_chunk:
             chunk, buf = buf[: cfg.wake_chunk], buf[cfg.wake_chunk:]
-            scores = oww.predict(np.ascontiguousarray(chunk))
+            score = oww.predict(np.ascontiguousarray(chunk))
             seen += 1
+            if score > peak:
+                peak = score
+            if debug and (score > 0.1 or seen % 12 == 0):
+                warm = " (warmup)" if seen <= warmup else ""
+                print(f"\n[bargein] score={score:.3f} run={run} peak={peak:.3f}{warm}",
+                      file=sys.stderr, flush=True)
             if seen <= warmup:
                 run = 0
                 continue
-            if max(scores.values()) >= cfg.wake_threshold:
+            if score >= threshold:
                 run += 1
                 if run >= need:
+                    if debug:
+                        print(f"\n[bargein] FIRED at score={score:.3f}",
+                              file=sys.stderr, flush=True)
                     interrupted.set()
                     stop_event.set()
                     return
             else:
                 run = 0
+    if debug:
+        print(f"\n[bargein] ended without firing; peak={peak:.3f} "
+              f"(threshold={threshold})", file=sys.stderr, flush=True)
     oww.reset()
 
 
@@ -172,7 +223,8 @@ def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
                 yield tts._synth(tail, lang)
 
     playback.play_stream(audio_chunks(), tts.sample_rate, stop_event,
-                         reference_sink=refbuf)
+                         reference_sink=refbuf,
+                         tail_padding_ms=pb_cfg.tail_padding_ms)
 
     stop_event.set()  # tell the watcher to stop if playback ended on its own
     if watcher is not None:
@@ -211,7 +263,7 @@ def _text_mode_read(toggle_event: threading.Event):
 
     Returns the line on Enter, or None if F1 was pressed (leave text mode). While
     here the mic is NOT read — text mode means voice listening is off until you
-    press F1 again. Echoes input and supports backspace.
+    press F1 again. Echoes terminal input and supports backspace.
     """
     import msvcrt
     import time
@@ -492,7 +544,7 @@ def main() -> None:
             audio = np.empty(0, dtype=np.float32)  # set by the voice branches below
 
             if text_mode:
-                # --- Text mode: type commands; voice listening is OFF. ---
+                # --- Text mode: type commands (terminal); voice OFF. ---
                 line = _text_mode_read(toggle_event)
                 if line is None:                   # F1 pressed -> back to voice
                     text_mode = False
@@ -543,6 +595,7 @@ def main() -> None:
                 # --- Speaker gate (personalization, NOT security; spoofable) ---
                 # Only per-turn; a verifier may also exist solely for the startup
                 # identity gate, which must not silently filter every command here.
+                _t = time.perf_counter()
                 if require_speaker and verifier is not None \
                         and voiceprint is not None:
                     is_match, score = verifier.verify(audio, voiceprint)
@@ -550,9 +603,11 @@ def main() -> None:
                         print(f"  speaker not recognized (score {score:.2f}) — ignoring.\n")
                         continue
                     print(f"  speaker verified (score {score:.2f}).")
+                    _t = _lap("speaker verify", _t)
 
                 # --- Transcribe (auto-detects language) ---
                 text, lang = transcriber.transcribe(audio)
+                _lap("stt (transcribe)", _t)
                 if not text:
                     print("  (no speech recognized)\n")
                     if cfg.not_understood_phrase.strip():
@@ -560,12 +615,32 @@ def main() -> None:
                     continue
                 print(f"  you [{lang}]: {text}")
 
+            # --- Deterministic self-shutdown (don't rely on the LLM tool call) ---
+            # "shut down yourself" etc. is a critical, hard-to-recover action, so
+            # handle it here from the transcript directly. The LLM was observed to
+            # sometimes just SAY "Shutting down." without calling shutdown_self,
+            # leaving Atlas running. This guarantees it exits. (Requires an explicit
+            # self-reference so "turn off the lights" won't match.)
+            if _is_self_shutdown(text):
+                print("\nShutting down (requested).")
+                tools.shutdown_requested = True
+                if cfg.shutdown_phrase.strip():    # guaranteed goodbye (not the LLM)
+                    announce(cfg.shutdown_phrase)
+                break
+
             # --- Think + speak. In text mode, no barge-in (voice stays off). ---
+            _t = time.perf_counter()
             interrupted = _respond(brain, tts, text, stream, oww, cfg, pb_cfg,
                                    lang, aec=aec, refbuf=refbuf,
                                    bargein=(typed_text is None))
+            _lap("respond (LLM + TTS + playback)", _t)
             if tools.restart_requested:            # reset_all asked to restart
                 restart = True
+                break
+            if tools.shutdown_requested:           # user asked Atlas to shut itself down
+                print("\nShutting down (requested).")
+                if cfg.shutdown_phrase.strip():    # guaranteed goodbye (not the LLM)
+                    announce(cfg.shutdown_phrase)
                 break
             if typed_text is not None:
                 print()

@@ -9,9 +9,10 @@
 sounddevice
 numpy>=1.26          # first NumPy with cp312 wheels
 
-# --- Wake word (openWakeWord) ---
-openwakeword
-onnxruntime          # inference backend for openWakeWord on Windows
+# --- Wake word ---
+# Custom PyTorch-trained "Atlas" detector (see wake_pytorch/). The trained model
+# is exported to ONNX and run here via onnxruntime — no openWakeWord dependency.
+onnxruntime          # runs the wake-word model (and insightface face recognition)
 
 # --- Voice activity detection ---
 # Use the -wheels fork: upstream `webrtcvad` has no cp312 wheels and fails to
@@ -20,6 +21,12 @@ webrtcvad-wheels
 
 # --- Speech-to-text ---
 faster-whisper
+# GPU STT (Config.stt_device="cuda"): CTranslate2 needs the CUDA 12 runtime libs.
+# The main venv uses CPU torch, so these pip wheels supply cublas/cudnn/cudart;
+# stt.py pre-loads their DLLs so CTranslate2 finds them. Omit for CPU-only STT.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cuda-runtime-cu12
 
 # --- Speaker verification (SpeechBrain ECAPA-TDNN) ---
 speechbrain

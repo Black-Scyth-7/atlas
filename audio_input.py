@@ -16,10 +16,9 @@ from typing import Protocol, Tuple
 import numpy as np
 import sounddevice as sd
 import webrtcvad
-import openwakeword
-from openwakeword.model import Model
 
 from config import Config
+from wake_pytorch.detector import WakeDetector
 
 
 class MicLike(Protocol):
@@ -39,19 +38,15 @@ def open_stream(cfg: Config) -> sd.InputStream:
     return stream
 
 
-def load_wake_model(cfg: Config) -> Model:
-    """Load the openWakeWord model, downloading base + pretrained models once."""
-    # Idempotent: fetches the melspectrogram/embedding base models and the
-    # bundled pretrained wake words on first run, then no-ops. Needs internet
-    # the first time only.
-    openwakeword.utils.download_models() # type: ignore
-    return Model(
-        wakeword_models=[cfg.wake_model],
-        inference_framework=cfg.wake_framework,
-    )
+def load_wake_model(cfg: Config) -> WakeDetector:
+    """Load the custom PyTorch MatchboxNet wake detector (ONNX via onnxruntime).
+
+    Fully local — no downloads. See wake_pytorch/ for training and export.
+    """
+    return WakeDetector(cfg.wake_model)
 
 
-def wait_for_wake_word(stream: MicLike, oww: Model, cfg: Config,
+def wait_for_wake_word(stream: MicLike, oww: WakeDetector, cfg: Config,
                        interrupt=None) -> bool:
     """Block until the wake word is detected. Returns True when it is.
 
@@ -77,12 +72,12 @@ def wait_for_wake_word(stream: MicLike, oww: Model, cfg: Config,
         buf = np.concatenate([buf, frame[:, 0]])
         while len(buf) >= cfg.wake_chunk:
             chunk, buf = buf[: cfg.wake_chunk], buf[cfg.wake_chunk:]
-            scores = oww.predict(np.ascontiguousarray(chunk))
+            score = oww.predict(np.ascontiguousarray(chunk))
             seen += 1
-            if seen <= warmup:      # let the buffers fill; ignore early spikes
+            if seen <= warmup:      # let the rolling window fill; ignore early scores
                 run = 0
                 continue
-            if max(scores.values()) >= cfg.wake_threshold:  # type: ignore
+            if score >= cfg.wake_threshold:
                 run += 1
                 if run >= need:
                     oww.reset()
@@ -160,7 +155,7 @@ if __name__ == "__main__":
     #   wake word -> record command -> save a WAV you can play back.
     cfg = Config()
 
-    print("Loading wake-word model (first run downloads it)...")
+    print("Loading wake-word model (wake_pytorch MatchboxNet)...")
     oww = load_wake_model(cfg)
     vad = webrtcvad.Vad(cfg.vad_aggressiveness)
 
