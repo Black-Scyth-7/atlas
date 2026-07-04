@@ -60,6 +60,10 @@ redis                # cache client (Memurai on Windows speaks the Redis protoco
 # --- RAG over documents ---
 pypdf                # extract text from PDFs for ingest.py
 
+# --- Live GUI (optional JARVIS-style holographic dashboard; run `python gui.py`) ---
+# Only needed for the GUI; the terminal app (`python main.py`) never imports it.
+PySide6
+
 # --- System control (Windows) ---
 pycaw                     # system + per-app volume/mute
 screen-brightness-control # display brightness (screenshots use Pillow, already a dep)

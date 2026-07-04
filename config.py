@@ -417,6 +417,37 @@ class PlaybackConfig:
 
 
 @dataclass
+class GuiConfig:
+    """JARVIS-style holographic dashboard (see gui.py, launched via `python gui.py`).
+
+    Only used by the optional PySide6 GUI; the terminal app ignores this. A
+    central atom (glowing nucleus + electron orbits) sits inside concentric HUD
+    tick-rings, flanked by chamfered data panels over a dark, bokeh-lit field.
+    The orb's colour follows the assistant's state; its pulse follows the live
+    mic/speech level streamed over ui_events.
+    """
+    fps: int = 60                     # animation refresh rate
+    window_w: int = 1180              # matches the reference HUD's wide aspect
+    window_h: int = 760
+    orb_max_frac: float = 0.30        # atom radius as a fraction of the orb widget
+    # Fixed orb colour (r, g, b) — the atom stays this colour in every state; the
+    # state still drives motion (faster spin while thinking) and the text labels.
+    # Set to None to instead colour the atom per state via state_colors.
+    orb_color: tuple | None = None
+    level_smoothing: float = 0.35     # 0..1 EMA weight for new audio levels
+    level_decay: float = 0.90         # idle decay of the pulse toward 0 per frame
+    transcript_max_lines: int = 200   # trim the transcript beyond this
+    # Atom colour per state, as (r, g, b) — all within the reference's blue/cyan
+    # family so the HUD reads as one holographic system.
+    state_colors: dict = field(default_factory=lambda: {
+        "idle": (44, 110, 165),        # deep calm blue
+        "listening": (40, 150, 120),   # muted teal (hearing you)
+        "thinking": (70, 120, 185),    # deep blue (working)
+        "speaking": (52, 140, 190),    # dim cyan (replying)
+    })
+
+
+@dataclass
 class AgentsConfig:
     """Iterative ReAct task agent on the one resident Qwen3: decide -> call a
     tool -> observe -> repeat until done. Pauses for spoken confirmation before

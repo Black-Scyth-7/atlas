@@ -234,6 +234,19 @@ password** (look at the camera, repeat a few phrases, then set a password). Ever
 later launch then asks you to verify all three before Atlas starts. Say
 **"Atlas"**, speak a command, and it replies aloud. Ctrl+C to quit.
 
+*Optional holographic GUI* — a JARVIS-style window (central atom + live data
+panels) that runs the exact same assistant on a worker thread:
+
+```powershell
+python main.py --gui     # same app, in the window (or: python gui.py)
+python main.py --no-gui  # force the terminal app even if ATLAS_GUI is set
+```
+
+Or set `ATLAS_GUI=1` in your `.env` to make the window the default. Needs
+`PySide6` (in `requirements.txt`). The window mirrors state (idle / listening /
+thinking / speaking), pulses with the mic, and shows the live transcript; **F1**
+still toggles the type-in box.
+
 *Optional manual enrollment / tuning* (also usable any time to add samples):
 
 ```powershell
