@@ -18,6 +18,8 @@ from typing import Iterable, Iterator, Optional
 import numpy as np
 import sounddevice as sd
 
+import ui_events as ux
+
 
 _SENTINEL = object()  # marks end of the chunk stream in the queue
 
@@ -81,6 +83,9 @@ def play_stream(
             if chunk.size:
                 if reference_sink is not None:
                     reference_sink.push(chunk, sample_rate)
+                # Live loudness for the GUI orb while Atlas speaks (chunk is
+                # float32 in [-1, 1]); no-op with no UI subscribed.
+                ux.audio_level(float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))))
                 stream.write(chunk)
     finally:
         # On a clean finish (not a barge-in stop), make sure the last samples

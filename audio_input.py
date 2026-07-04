@@ -19,6 +19,7 @@ import webrtcvad
 
 from config import Config
 from wake_pytorch.detector import WakeDetector
+import ui_events as ux
 
 
 class MicLike(Protocol):
@@ -110,6 +111,8 @@ def record_until_silence(stream: MicLike, vad: webrtcvad.Vad,
     for i in range(max_frames):
         frame, _ = stream.read(cfg.frame_samples)
         pcm = frame[:, 0]
+        # Live loudness for the GUI orb (0..~1); no-op with no UI subscribed.
+        ux.audio_level(float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) / 32768.0)
         is_speech = vad.is_speech(pcm.tobytes(), cfg.sample_rate)
 
         if not spoke_at_all:

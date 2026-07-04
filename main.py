@@ -14,6 +14,7 @@ Run enroll.py once first to create the voiceprint (if the speaker gate is on).
 """
 
 import os
+import queue
 import re
 import sys
 import threading
@@ -55,6 +56,7 @@ from config import (
     AuthConfig, DspConfig, CodeAgentConfig,
 )
 import audio_input
+import ui_events as ux
 from speaker_id import SpeakerVerifier
 from stt import Transcriber
 from llm import LLM, strip_think
@@ -205,11 +207,13 @@ def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
 
     def audio_chunks():
         print("  atlas: ", end="", flush=True)
+        ux.set_state("speaking")
         buffer = ""
         for delta in brain.stream_reply(user_text):
             if stop_event.is_set():
                 break
             print(delta, end="", flush=True)
+            ux.atlas_delta(delta)
             buffer += delta
             sentences, buffer = _flush_sentences(buffer)
             for sentence in sentences:
@@ -221,6 +225,7 @@ def _respond(brain: LLM, tts: TTS, user_text: str, stream, oww, cfg: Config,
             tail = strip_think(buffer)
             if tail:
                 yield tts._synth(tail, lang)
+        ux.atlas_done()
 
     playback.play_stream(audio_chunks(), tts.sample_rate, stop_event,
                          reference_sink=refbuf,
@@ -258,8 +263,9 @@ def _text_key_watcher(cfg: Config, toggle_event: threading.Event,
         time.sleep(0.04)
 
 
-def _text_mode_read(toggle_event: threading.Event):
-    """Read one typed line in text mode (Windows msvcrt, char by char).
+def _text_mode_read(toggle_event: threading.Event, gui_q=None):
+    """Read one typed line in text mode (Windows msvcrt, char by char) OR from the
+    GUI text box (gui_q).
 
     Returns the line on Enter, or None if F1 was pressed (leave text mode). While
     here the mic is NOT read — text mode means voice listening is off until you
@@ -277,6 +283,14 @@ def _text_mode_read(toggle_event: threading.Event):
             sys.stdout.write("\n")
             sys.stdout.flush()
             return None
+        if gui_q is not None:               # a line typed in the GUI box
+            try:
+                line = gui_q.get_nowait()
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return line.strip()
+            except queue.Empty:
+                pass
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
             if ch in ("\r", "\n"):
@@ -530,8 +544,18 @@ def main() -> None:
         threading.Thread(target=_text_key_watcher,
                          args=(cfg, toggle_event, text_stop), daemon=True).start()
 
+    # GUI text box (gui.py): typed commands land in this queue and are read in
+    # text mode, exactly like terminal typing. The box only appears after F1.
+    gui_text_q: "queue.Queue[str]" = queue.Queue()
+    ux.set_input_handler(gui_text_q.put)
+
     hint = " or press F1 to type" if text_input_on else ""
     print(f"Ready. Say the wake word ('{wake_name}'){hint}. Ctrl+C to quit.\n")
+    ux.status(user=owner_name or "—", authority=owner_role,
+              model=os.path.splitext(os.path.basename(llm_cfg.model_path))[0],
+              wake_word=wake_name, mic=True)
+    ux.set_state("idle")
+    ux.ready()      # online + ready: the GUI reveals its (pre-populated) window now
     if cfg.startup_phrase.strip():
         announce(cfg.startup_phrase)   # speak the ready greeting aloud
     skip_wake = False   # barge-in: record immediately, no wake word
@@ -544,10 +568,11 @@ def main() -> None:
             audio = np.empty(0, dtype=np.float32)  # set by the voice branches below
 
             if text_mode:
-                # --- Text mode: type commands (terminal); voice OFF. ---
-                line = _text_mode_read(toggle_event)
+                # --- Text mode: type commands (terminal or GUI box); voice OFF. ---
+                line = _text_mode_read(toggle_event, gui_text_q)
                 if line is None:                   # F1 pressed -> back to voice
                     text_mode = False
+                    ux.text_mode(False)            # GUI: hide the text box
                     print("  (voice mode — say the wake word)\n")
                     continue
                 if not line:
@@ -555,10 +580,12 @@ def main() -> None:
                 typed_text = line
             elif skip_wake:
                 skip_wake = False
+                ux.set_state("listening")
                 audio = audio_input.record_until_silence(stream, vad, cfg)
             elif follow_up:
                 follow_up = False
                 print("(listening for follow-up...)")
+                ux.set_state("listening")
                 audio = audio_input.record_until_silence(
                     stream, vad, cfg, start_timeout_ms=cfg.followup_window_ms)
                 if audio.size == 0:
@@ -571,20 +598,30 @@ def main() -> None:
                 if hasattr(stream, "drain"):
                     stream.drain()
                 oww.reset()
+                ux.set_state("idle")
                 woke = audio_input.wait_for_wake_word(
                     stream, oww, cfg, interrupt=toggle_event if text_input_on else None)
                 if not woke:                       # F1 pressed -> enter text mode
                     toggle_event.clear()
                     text_mode = True
+                    while not gui_text_q.empty():  # drop any stale queued input
+                        try:
+                            gui_text_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    ux.text_mode(True)             # GUI: show + focus the text box
                     print("  (text mode — type commands; press F1 for voice)")
                     continue
                 print("(listening...)")
+                ux.set_state("listening")
                 audio = audio_input.record_until_silence(stream, vad, cfg)
 
             if typed_text is not None:
                 # --- Typed command: skip recording, speaker gate, and STT ---
                 text, lang = typed_text, (cfg.stt_language or "en")
                 print(f"  you [text]: {text}")
+                ux.set_state("thinking")
+                ux.user_said(text, lang)
             else:
                 if audio.size == 0:
                     print("  (no speech detected)\n")
@@ -606,6 +643,7 @@ def main() -> None:
                     _t = _lap("speaker verify", _t)
 
                 # --- Transcribe (auto-detects language) ---
+                ux.set_state("thinking")
                 text, lang = transcriber.transcribe(audio)
                 _lap("stt (transcribe)", _t)
                 if not text:
@@ -614,6 +652,7 @@ def main() -> None:
                         announce(cfg.not_understood_phrase)
                     continue
                 print(f"  you [{lang}]: {text}")
+                ux.user_said(text, lang)
 
             # --- Deterministic self-shutdown (don't rely on the LLM tool call) ---
             # "shut down yourself" etc. is a critical, hard-to-recover action, so
@@ -684,5 +723,24 @@ def main() -> None:
         os._exit(0)
 
 
+def _want_gui() -> bool:
+    """Launch the holographic GUI instead of the terminal app?
+
+    True if `--gui` is passed on the command line OR ATLAS_GUI is set truthy
+    (in the environment or .env). `--no-gui` forces the terminal app even if the
+    env var is on. The GUI runs this same loop unchanged on a worker thread.
+    """
+    argv = sys.argv[1:]
+    if "--no-gui" in argv:
+        return False
+    if "--gui" in argv:
+        return True
+    return os.environ.get("ATLAS_GUI", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 if __name__ == "__main__":
-    main()
+    if _want_gui():
+        import gui
+        gui.main()          # opens the window; runs main() on a worker thread
+    else:
+        main()
