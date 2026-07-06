@@ -59,14 +59,20 @@ class Transcriber:
         # Pre-normalize the caption-hallucination blocklist once for fast lookup.
         self._halluc = {_norm(p) for p in
                         getattr(cfg, "stt_hallucination_phrases", ()) if _norm(p)}
+        self.model = None
+        self.on_gpu = False
+        self._load_model()
+
+    def _load_model(self) -> None:
+        """(Re)load the Whisper model on the configured device; fall back to CPU
+        if the GPU load fails. Sets self.model and self.on_gpu."""
+        cfg = self.cfg
         if cfg.stt_device == "cuda":
             _preload_cuda_dlls()
         try:
-            self.model = WhisperModel(
-                cfg.stt_model,
-                device=cfg.stt_device,
-                compute_type=cfg.stt_compute_type,
-            )
+            self.model = WhisperModel(cfg.stt_model, device=cfg.stt_device,
+                                      compute_type=cfg.stt_compute_type)
+            self.on_gpu = (cfg.stt_device == "cuda")
         except Exception as e:
             if cfg.stt_device == "cuda":
                 # GPU unavailable (missing CUDA libs / OOM / driver) — degrade to
@@ -74,8 +80,27 @@ class Transcriber:
                 print(f"STT: GPU load failed ({e}); falling back to CPU int8.")
                 self.model = WhisperModel(cfg.stt_model, device="cpu",
                                           compute_type="int8")
+                self.on_gpu = False
             else:
                 raise
+
+    def release(self) -> bool:
+        """Unload the model to free its VRAM (e.g. while the vision model runs on
+        a small GPU). Returns True if a GPU model was actually freed. The next
+        transcribe() reloads it lazily."""
+        if self.model is None or not self.on_gpu:
+            return False
+        import gc
+
+        self.model = None            # CTranslate2 frees the GPU memory on destruct
+        self.on_gpu = False
+        gc.collect()
+        return True
+
+    def ensure_loaded(self) -> None:
+        """Reload the model if it was released (no-op if already loaded)."""
+        if self.model is None:
+            self._load_model()
 
     def transcribe(self, audio: np.ndarray) -> tuple[str, str]:
         """Transcribe a float32 16 kHz mono clip. Returns (text, language).
@@ -104,6 +129,7 @@ class Transcriber:
         """
         if audio.size == 0:
             return "", ""
+        self.ensure_loaded()   # reload if it was parked to free VRAM for vision
         # Energy floor: real speech is rms ~0.05-0.2; near-silent clips (rms well
         # under this) are the ones Whisper hallucinates captions from.
         min_rms = getattr(self.cfg, "stt_min_rms", 0.0)

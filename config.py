@@ -37,7 +37,18 @@ class Config:
     # hardest sound-alike in your own speech peaks ~0.63, so this cleanly rejects
     # your chatter with zero recall cost. Lower toward 0.5 if a quiet/far "Atlas"
     # ever gets missed on a live mic; raise to reduce false triggers further.
-    wake_threshold: float = 0.75
+    wake_threshold: float = 0.95
+    # Speech-energy gate (frame RMS, 0..1): the detector ignores frames quieter
+    # than this so a wake can only fire on an audible burst. The MatchboxNet
+    # scores the QUIET DECAY TAIL of any preceding sound very high (a word ends,
+    # its energy leaves the rolling window, and a near-silent frame reads as
+    # "Atlas") — that is the "wakes on any word" false trigger. Real "Atlas"
+    # fires at rms >0.05; live false wakes fire at rms ~0.009, so 0.02 rejects
+    # them with a wide margin (observed live false wakes peaked at rms 0.013, so
+    # 0.015 blocks every one while real spoken "Atlas" fires at rms 0.05-0.36).
+    # Set 0.0 to disable (raw model). Raise if faint room noise still triggers;
+    # lower toward 0.01 if a soft/distant "Atlas" is ever missed.
+    wake_min_rms: float = 0.015
     # The detector's rolling window fills over the first ~1.5 s after a reset, so
     # early scores see mostly zero-padded audio; ignore detections during this
     # warm-up of 80 ms chunks so Atlas doesn't wake itself at startup.
@@ -46,6 +57,8 @@ class Config:
     # spans several chunks; a lone spike from silence/transient noise doesn't.
     wake_consecutive: int = 3
     # --- Barge-in wake detection (interrupt mid-reply) ---
+    # ON/OFF switch for barge-in is PlaybackConfig.allow_barge_in (set False to
+    # disable entirely). The settings below only TUNE it when it's on.
     # Detecting "atlas" WHILE Atlas is speaking is harder than from idle: your
     # voice competes with Atlas's own (partially echo-cancelled) voice in the mic.
     # So barge-in gets its OWN, more sensitive settings, decoupled from the strict
@@ -54,14 +67,33 @@ class Config:
     bargein_threshold: float = 0.5      # lower than wake_threshold (more sensitive)
     bargein_consecutive: int = 2        # fewer consecutive chunks than wake
     bargein_warmup_chunks: int = 4      # shorter dead-zone at reply start
+    # HOW barge-in detects you:
+    #   "speech"   - fire when YOU start talking (near-end RMS after echo
+    #                cancellation). Cheap, so it stays real-time and interrupts
+    #                WHILE Atlas speaks. You don't need to say the wake word.
+    #   "wakeword" - run the "Atlas" model during playback. Accurate, but its
+    #                per-chunk MFCC+ONNX can't keep up on a busy CPU, so the
+    #                interrupt lands AFTER the reply finishes (observed lag).
+    # Speech mode relies on decent echo cancellation (run calibrate_aec.py) or it
+    # self-triggers on Atlas's own voice.
+    bargein_mode: str = "speech"
+    # Near-end RMS (0..1, post-AEC) that counts as you speaking, in speech mode.
+    # Real speech is ~0.05-0.2; RAISE if Atlas's echo self-interrupts it, LOWER if
+    # your interrupt is missed. Watch live values with ATLAS_BARGEIN_DEBUG=1.
+    bargein_speech_rms: float = 0.02
     # Set env ATLAS_BARGEIN_DEBUG=1 to print live barge-in scores while Atlas
-    # speaks, so you can tune bargein_threshold to your mic/echo.
+    # speaks, so you can tune the threshold to your mic/echo.
 
     # --- Recording / voice activity detection (webrtcvad) ---
     silence_tail_ms: int = 800      # stop after this much trailing silence
     max_command_ms: int = 12000     # hard cap on a single command
     vad_aggressiveness: int = 2     # 0 (lenient) .. 3 (aggressive)
     preroll_frames: int = 5         # ~150 ms of lead-in kept before speech starts
+    # After the wake word fires, how long to wait for you to START speaking. If
+    # you begin within this window, Atlas records until you go silent (see
+    # silence_tail_ms); if the window passes in silence, it stops and returns to
+    # waiting for the wake word instead of hanging for the full max_command_ms.
+    command_start_timeout_ms: int = 3000
 
     # --- Hands-free follow-up ---
     # After Atlas replies, keep listening this long for a follow-up command
@@ -326,7 +358,12 @@ class VisionConfig:
     # Grounding (locate an element to click) needs more detail than describing,
     # so the screen is downscaled less for locate() — higher = more accurate on
     # small UI targets, but slower. Set equal to max_image_px to disable.
-    ground_image_px: int = 1568
+    # NOTE: the CLIP image encoder runs on CUDA even when n_gpu_layers=0, and its
+    # per-image buffers scale ~quadratically with this. On an 8 GB card already
+    # holding the 8B LLM + STT, 1568 px overflowed VRAM and aborted the process
+    # (CUDA error at encode). 1024 cuts encode memory to ~40%; drop to 768 if it
+    # still OOMs, or set n_gpu_layers=-1 here AND free LLM VRAM to run it on GPU.
+    ground_image_px: int = 1024
     max_tokens: int = 256
 
 
@@ -383,6 +420,34 @@ class AuthConfig:
 
 
 @dataclass
+class VaultConfig:
+    """Encrypted store for website logins so Atlas can sign the user in on
+    request (see vault.py). Passwords are NEVER stored in plaintext.
+
+    Two composable at-rest protections:
+      * Windows DPAPI (default): sealed to your Windows account, no prompt —
+        Atlas logs in hands-free. Useless if the file is copied elsewhere.
+      * Master password (optional): adds an AES layer under a key derived from a
+        password you type once per session; keeps the vault encrypted even
+        against other programs running as you. Required on non-Windows (no DPAPI).
+    """
+
+    enabled: bool = True
+    vault_path: str = "vault.dat"
+    use_dpapi: bool = True
+    # Set True to also require a master password (prompted once per session).
+    master_password: bool = False
+    # Seconds to wait for a login page to load before autofilling by keyboard.
+    # Raise it on a slow connection; the username field must be focused by then.
+    autofill_delay: float = 4.0
+    # Preferred login method: drive the browser DOM over the DevTools Protocol
+    # (fast, reliable, no VRAM). Needs `pip install playwright` (lib only — it
+    # attaches to your real Brave/Chrome). If playwright isn't installed, login
+    # falls back to vision-guided control, then blind keyboard autofill.
+    use_cdp_login: bool = True
+
+
+@dataclass
 class DspConfig:
     """Mic-side audio DSP: RNNoise noise suppression + acoustic echo
     cancellation (see audio_dsp.py). Both are best-effort — if a backend can't
@@ -390,7 +455,7 @@ class DspConfig:
 
     # Noise suppression (RNNoise) on the captured mic audio — helps the wake
     # word, VAD, and STT work in a noisy room.
-    enable_noise_suppression: bool = False
+    enable_noise_suppression: bool = True
 
     # Acoustic echo cancellation during playback, so Atlas's own voice coming
     # out of the speakers doesn't false-trigger the wake word (barge-in without
@@ -401,15 +466,17 @@ class DspConfig:
     aec_mu: float = 0.5           # NLMS adaptation step (0..1)
     # Extra bulk delay (ms) to align the playback reference with the mic; tune
     # up if echo isn't being removed (system output+input latency varies).
-    aec_ref_delay_ms: int = 0
+    aec_ref_delay_ms:  int = 208
 
 
 @dataclass
 class PlaybackConfig:
     # --- Playback / barge-in ---
-    # When True, Atlas listens for the wake word while speaking and stops
-    # talking if it hears you (barge-in). See playback.py / main.py for the hook.
-    allow_barge_in: bool = True
+    # MASTER ON/OFF for barge-in (interrupting Atlas mid-reply). Set False to
+    # turn the whole feature off — Atlas will finish every reply and never listen
+    # to the mic while speaking. When True, HOW it detects you is tuned by the
+    # Config.bargein_* settings (bargein_mode, bargein_speech_rms, ...).
+    allow_barge_in: bool = False
     # Trailing silence (ms) written after the last sentence, plus a matching
     # wait, so the end of a reply isn't clipped when the output stream stops.
     # Raise this if you still hear the last word cut off.
@@ -474,7 +541,7 @@ class AgentsConfig:
             "run_command", "debug_python", "reset_all", "create_tool",
             "remove_tool", "create_github_repo", "close_app", "open_app",
             "write_file", "edit_file", "register_user", "shutdown",
-            "restart_system", "control_app", "open_website"])
+            "restart_system", "control_app", "open_website", "close_website"])
 
     react_system_prompt: str = (
         "You are Atlas, a capable voice assistant that completes tasks by using "

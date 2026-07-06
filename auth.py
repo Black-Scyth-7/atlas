@@ -389,7 +389,7 @@ def authenticate(cfg, auth, verifier, voiceprint, faces, stream, vad, speak):
 
         # --- Voice — against THIS user's voiceprint (skipped if they have none).
         voice_ok = True
-        vp = _load_user_voiceprint(verifier, cfg, candidate) if verifier else None
+        vp = _load_user_voiceprint(verifier, cfg, candidate) if verifier else None # type: ignore
         if face_ok and vp is not None:
             phrase = _PHRASES[attempt % len(_PHRASES)]
             print("\n=== Voice login ===")
@@ -405,7 +405,8 @@ def authenticate(cfg, auth, verifier, voiceprint, faces, stream, vad, speak):
                       + (f" Authority: {role}." if role else ""))
             else:
                 speak("Welcome back.")
-            return {"name": candidate, "role": role, "voiceprint": vp or voiceprint}
+            return {"name": candidate, "role": role,
+                    "voiceprint": vp if vp is not None else voiceprint}
 
         reason = ("your face or voice" if not face_ok and not voice_ok
                   else "your face" if not face_ok else "your voice")

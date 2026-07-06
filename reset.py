@@ -31,7 +31,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Import config for the canonical paths; fall back to defaults if it can't load.
 try:
-    from config import AuthConfig, CacheConfig, Config, FaceConfig, MemoryConfig, StateConfig
+    from config import (AuthConfig, CacheConfig, Config, FaceConfig,
+                        MemoryConfig, StateConfig, VaultConfig)
     _cfg, _auth, _face = Config(), AuthConfig(), FaceConfig()
     _mem, _state, _cache = MemoryConfig(), StateConfig(), CacheConfig()
     VOICEPRINT = _cfg.voiceprint_path
@@ -39,11 +40,13 @@ try:
     USERS = _auth.users_path
     FACES = getattr(_face, "db_path", "faces.npz")
     QDRANT = getattr(_mem, "qdrant_path", "qdrant_data")
+    VAULT = VaultConfig().vault_path
 except Exception as e:                                    # pragma: no cover
     print(f"(couldn't import config: {e}; using defaults)")
     _state = _cache = None
     VOICEPRINT, PASSWORD, USERS, FACES, QDRANT = (
         "voiceprint.npy", "auth_secret.dat", "users.json", "faces.npz", "qdrant_data")
+    VAULT = "vault.dat"
 
 VOICEPRINTS_DIR = "voiceprints"
 OUTPUT_DIRS = ["crew_output", "meetings", "photos"]
@@ -78,7 +81,7 @@ def _rm(path: str, removed: list, dry: bool) -> None:
 
 
 def reset_identity(removed: list, dry: bool) -> None:
-    for path in (VOICEPRINT, VOICEPRINTS_DIR, FACES, PASSWORD, USERS):
+    for path in (VOICEPRINT, VOICEPRINTS_DIR, FACES, PASSWORD, USERS, VAULT):
         _rm(path, removed, dry)
 
 

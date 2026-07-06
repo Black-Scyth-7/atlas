@@ -41,6 +41,9 @@ faces.npz
 # Startup password hash (keep local)
 auth_secret.dat
 
+# Encrypted website-login vault (DPAPI/AES; keep local, never commit)
+vault.dat
+
 # Wake-word training (PyTorch): GPU venv + data/features/model artifacts.
 # Source scripts in wake_pytorch/ ARE tracked; only the heavy outputs are ignored.
 wake_pytorch/.venv/
@@ -51,6 +54,9 @@ wake_pytorch/*.pt
 wake_pytorch/*.onnx
 # ...except the exported runtime wake-word model, which ships in-repo.
 !wake_pytorch/atlas.onnx
+# Training run logs + local model backups (transient)
+wake_pytorch/*.log
+wake_pytorch/backup/
 
 .vscode/
 # face window crash log

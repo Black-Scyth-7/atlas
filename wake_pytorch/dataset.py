@@ -30,6 +30,7 @@ DATA = BASE / "data"
 POS_DIR = DATA / "positive"            # Kokoro TTS positives
 REAL_DIR = DATA / "positive_real"      # your own recorded "Atlas" (record_positives.py)
 REAL_NEG_DIR = DATA / "negative_real"  # your own NON-"Atlas" speech (record_negatives.py)
+NEG_WORDS_DIR = DATA / "negative_words"  # TTS isolated single-word negatives (gen_negatives_tts.py)
 MANIFEST = DATA / "negatives_manifest.json"
 
 
@@ -76,6 +77,7 @@ class WakeDataset(Dataset):
                  positives: list[str] | None = None,
                  real_positives: list[str] | None = None,
                  real_negatives: list[str] | None = None,
+                 neg_words: list[str] | None = None,
                  real_frac: float = 0.5, real_neg_frac: float = 0.35,
                  seed: int = 0):
         self.train = train
@@ -100,11 +102,26 @@ class WakeDataset(Dataset):
         self.neg_noise = man.get("noise", [])
         self.neg_quiet = man.get("quiet", [])
         self.bg_pool = self.neg_music + self.neg_noise    # augmentation backgrounds
-        # Negative sources with sampling weights (hard speech negatives matter most).
-        self.neg_sources = [
-            (self.neg_speech, 0.45), (self.neg_noise, 0.20),
-            (self.neg_music, 0.15), (self.neg_quiet, 0.20),
-        ]
+        # ISOLATED single-word negatives (TTS, same format as positives). These
+        # are the critical hard negatives: without them the model shortcuts to
+        # "any short word in quiet = Atlas" and wakes on hello/hey/yellow/help.
+        # Heavily weighted so that shortcut can't survive training.
+        self.neg_words = (list(neg_words) if neg_words is not None
+                          else sorted(str(p) for p in NEG_WORDS_DIR.glob("*.wav")))
+        # Negative sources with sampling weights. Isolated words dominate when
+        # present (they fix the false-wake-on-any-word failure); otherwise the
+        # weights fall back to the hard MUSAN speech babble.
+        if self.neg_words:
+            self.neg_sources = [
+                (self.neg_words, 0.45), (self.neg_speech, 0.25),
+                (self.neg_noise, 0.12), (self.neg_music, 0.08),
+                (self.neg_quiet, 0.10),
+            ]
+        else:
+            self.neg_sources = [
+                (self.neg_speech, 0.45), (self.neg_noise, 0.20),
+                (self.neg_music, 0.15), (self.neg_quiet, 0.20),
+            ]
         self.neg_sources = [(s, w) for s, w in self.neg_sources if s]
         if not self.neg_sources:
             raise SystemExit("No negatives; run prepare_negatives.py first.")

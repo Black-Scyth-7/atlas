@@ -53,7 +53,7 @@ for _stream in (sys.stdout, sys.stderr):
 from config import (
     Config, LLMConfig, TTSConfig, PlaybackConfig, ToolsConfig, MemoryConfig,
     StateConfig, CacheConfig, RAGConfig, AgentsConfig, VisionConfig, FaceConfig,
-    AuthConfig, DspConfig, CodeAgentConfig,
+    AuthConfig, DspConfig, CodeAgentConfig, VaultConfig,
 )
 import audio_input
 import ui_events as ux
@@ -114,30 +114,38 @@ def _flush_sentences(buffer: str) -> tuple[list[str], str]:
 def _bargein_watcher(stream, oww, cfg: Config,
                      stop_event: threading.Event, interrupted: threading.Event,
                      aec=None, refbuf=None) -> None:
-    """While Atlas speaks, listen for the wake word and signal an interrupt.
+    """While Atlas speaks, watch the mic and signal an interrupt (barge-in).
 
     Runs only during playback, when the main loop is NOT reading the mic, so it
     has exclusive access to the shared input stream. When an echo canceller +
     reference buffer are supplied, Atlas's own voice (the speaker output) is
     cancelled from the mic first, so it works on open speakers without
     false-triggering on itself; otherwise it assumes headphones.
+
+    Two modes (cfg.bargein_mode):
+      "speech"   - fire on near-end speech ENERGY (RMS after echo cancellation).
+                   Cheap per frame, so it keeps up with real time and interrupts
+                   WHILE Atlas talks. The wake model is NOT run.
+      "wakeword" - require the spoken wake word via the model. Accurate, but its
+                   per-chunk MFCC+ONNX can't keep pace during playback on a busy
+                   CPU, so the interrupt tends to land AFTER the reply ends.
     """
     oww.reset()
     if aec is not None:
         aec.reset()
     if refbuf is not None:
         refbuf.clear()
-    # Barge-in uses its OWN, more sensitive detection settings (see Config): a
-    # lower threshold, fewer consecutive chunks, and a shorter warm-up than the
-    # strict idle wake, because your voice has to cut through Atlas's own
-    # (partially echo-cancelled) speech. Falls back to the wake settings if the
-    # barge-in ones aren't defined.
+    # Barge-in uses its OWN, more sensitive settings (see Config): fewer
+    # consecutive hits and a shorter warm-up than the strict idle wake, because
+    # your voice has to cut through Atlas's own (partially cancelled) speech.
     warmup = max(0, getattr(cfg, "bargein_warmup_chunks",
                             getattr(cfg, "wake_warmup_chunks", 0)))
     need = max(1, getattr(cfg, "bargein_consecutive",
                           getattr(cfg, "wake_consecutive", 1)))
-    threshold = getattr(cfg, "bargein_threshold",
-                        getattr(cfg, "wake_threshold", 0.5))
+    mode = getattr(cfg, "bargein_mode", "speech")
+    threshold = (getattr(cfg, "bargein_speech_rms", 0.02) if mode == "speech"
+                 else getattr(cfg, "bargein_threshold",
+                              getattr(cfg, "wake_threshold", 0.5)))
     debug = bool(os.environ.get("ATLAS_BARGEIN_DEBUG"))
     peak = 0.0
     seen = 0
@@ -151,6 +159,34 @@ def _bargein_watcher(stream, oww, cfg: Config,
         pcm = frame[:, 0]
         if aec is not None and refbuf is not None:
             pcm = aec.cancel(pcm, refbuf.take(cfg.frame_samples))
+
+        if mode == "speech":
+            # Near-end energy: cheap enough to stay real-time, so the interrupt
+            # fires the instant you start talking (no wake word needed).
+            seen += 1
+            score = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) / 32768.0
+            peak = max(peak, score)
+            if debug and (score > threshold * 0.5 or seen % 16 == 0):
+                warm = " (warmup)" if seen <= warmup else ""
+                print(f"\n[bargein] rms={score:.4f} run={run} peak={peak:.4f}"
+                      f" thr={threshold:.4f}{warm}", file=sys.stderr, flush=True)
+            if seen <= warmup:
+                run = 0
+                continue
+            if score >= threshold:
+                run += 1
+                if run >= need:
+                    if debug:
+                        print(f"\n[bargein] FIRED (speech) rms={score:.4f}",
+                              file=sys.stderr, flush=True)
+                    interrupted.set()
+                    stop_event.set()
+                    return
+            else:
+                run = 0
+            continue
+
+        # wakeword mode: score the "Atlas" model over the rolling window.
         buf = np.concatenate([buf, pcm])
         while len(buf) >= cfg.wake_chunk:
             chunk, buf = buf[: cfg.wake_chunk], buf[cfg.wake_chunk:]
@@ -177,7 +213,7 @@ def _bargein_watcher(stream, oww, cfg: Config,
             else:
                 run = 0
     if debug:
-        print(f"\n[bargein] ended without firing; peak={peak:.3f} "
+        print(f"\n[bargein] ended without firing; peak={peak:.4f} "
               f"(threshold={threshold})", file=sys.stderr, flush=True)
     oww.reset()
 
@@ -387,6 +423,23 @@ def main() -> None:
         print(f"State: DISABLED — {store.disabled_reason}.")
 
     agents_cfg = AgentsConfig()
+
+    # Encrypted credential vault for website logins (optional; see vault.py).
+    vault = None
+    vault_cfg = VaultConfig()
+    if vault_cfg.enabled:
+        try:
+            from vault import Vault
+
+            vault = Vault(vault_cfg.vault_path, use_dpapi=vault_cfg.use_dpapi,
+                          master_password_required=vault_cfg.master_password)
+            n = len(vault.list_sites())
+            print(f"Vault: enabled ({n} saved login{'s' * (n != 1)}, "
+                  f"{'DPAPI + master password' if vault_cfg.master_password else 'DPAPI'}).")
+        except Exception as e:
+            print(f"Vault: DISABLED — {e}")
+            vault = None
+
     tools = Tools(
         on_timer_fire=announce,
         web_search_backend=tools_cfg.web_search_backend,
@@ -411,6 +464,9 @@ def main() -> None:
         auto_install_deps=tools_cfg.auto_install_tool_deps,
         test_mode=auth_cfg.test_mode,
         admin_only_tools=agents_cfg.admin_only_tools,
+        vault=vault,
+        login_autofill_delay=vault_cfg.autofill_delay,
+        use_cdp_login=vault_cfg.use_cdp_login,
     )
 
     brain = LLM(llm_cfg, tools=tools, memory=memory, store=store, docs=docs,
@@ -419,7 +475,7 @@ def main() -> None:
     # prefers the CrewAI code_agent). Wired now that the LLM exists.
     tools._code_gen = brain.raw_complete
     # Let reset_all also wipe the live in-session conversation history.
-    tools._clear_session = brain.reset_session
+    tools._clear_session = brain.reset_session # type: ignore
     if brain.orchestrator is not None:
         confirm = "confirm risky actions" if agents_cfg.confirm_risky \
             else "fully autonomous"
@@ -581,7 +637,9 @@ def main() -> None:
             elif skip_wake:
                 skip_wake = False
                 ux.set_state("listening")
-                audio = audio_input.record_until_silence(stream, vad, cfg)
+                audio = audio_input.record_until_silence(
+                    stream, vad, cfg,
+                    start_timeout_ms=cfg.command_start_timeout_ms)
             elif follow_up:
                 follow_up = False
                 print("(listening for follow-up...)")
@@ -614,7 +672,9 @@ def main() -> None:
                     continue
                 print("(listening...)")
                 ux.set_state("listening")
-                audio = audio_input.record_until_silence(stream, vad, cfg)
+                audio = audio_input.record_until_silence(
+                    stream, vad, cfg,
+                    start_timeout_ms=cfg.command_start_timeout_ms)
 
             if typed_text is not None:
                 # --- Typed command: skip recording, speaker gate, and STT ---

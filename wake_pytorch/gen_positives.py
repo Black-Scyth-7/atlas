@@ -39,7 +39,7 @@ VOICES_B = ["bf_alice", "bf_emma", "bf_isabella", "bf_lily",
             "bm_daniel", "bm_fable", "bm_george", "bm_lewis"]
 
 TEXTS = ["Atlas", "Atlas.", "Atlas?", "Atlas!"]
-SPEEDS = [0.85, 0.95, 1.0, 1.1, 1.2]
+SPEEDS = [0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3]
 
 
 def _trim_silence(x: np.ndarray, thresh_frac: float = 0.02,
@@ -81,6 +81,13 @@ def main(limit: int | None = None) -> None:
                     print(f"\nReached --limit {limit}; stopping.")
                     print(f"Done: {made} positive clips in {OUT}")
                     return
+                tag = text.strip(".?!").lower() + \
+                    ("_q" if "?" in text else "_e" if "!" in text
+                     else "_p" if "." in text else "")
+                fn = f"{voice}_{tag}_s{int(speed * 100)}.wav"
+                if (OUT / fn).exists():           # resumable: skip already-made
+                    made += 1
+                    continue
                 # Kokoro yields (graphemes, phonemes, audio) per chunk; a single
                 # word is one chunk. Concatenate defensively.
                 chunks = [a for _, _, a in pipe(text, voice=voice, speed=speed)]
@@ -90,10 +97,6 @@ def main(limit: int | None = None) -> None:
                     (c.detach().cpu().numpy() if isinstance(c, torch.Tensor)
                      else np.asarray(c)).astype(np.float32) for c in chunks])
                 pcm = _postprocess(audio)
-                tag = text.strip(".?!").lower() + \
-                    ("_q" if "?" in text else "_e" if "!" in text
-                     else "_p" if "." in text else "")
-                fn = f"{voice}_{tag}_s{int(speed * 100)}.wav"
                 sf.write(str(OUT / fn), pcm, SAMPLE_RATE)
                 made += 1
                 if made % 25 == 0:

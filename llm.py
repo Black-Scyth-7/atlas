@@ -14,12 +14,25 @@ Run this file directly for a standalone Step 4/6 test (typed prompts):
 """
 
 import datetime
+import math
 import os
 import re
 import time
 from typing import Iterator
 
-from llama_cpp import Llama
+import numpy as np
+from llama_cpp import Llama, LogitsProcessorList
+
+import ui_events as ux
+
+# Neural-activity readout (see ui_events.llm_activity / the GUI panel). A
+# logits_processor taps each generated token's logits as they're produced and
+# records a small trace (confidence + top-k candidates) the UI plays back. This
+# is genuinely cheap — the logits are already computed for sampling, so it costs
+# one top-k over the vocab per token and needs NO logits_all buffer (which would
+# add gigabytes of host RAM). Bounded so the payload and work stay tiny.
+_ACT_TOPK = 5           # candidate alternatives kept per token
+_ACT_MAX_TOKENS = 96    # only the tail of a long reply is visualised
 
 # Opt-in per-stage timing (ATLAS_TIMING=1). Off by default; prints where each
 # turn's seconds go so latency can be diagnosed without a profiler.
@@ -53,14 +66,77 @@ def strip_think(text: str) -> str:
     return text.strip()
 
 
+def _clean_token(tok: str) -> str:
+    """Make a raw model token safe/short to show in a HUD label. Whitespace is
+    made visible (BPE tokens often carry a leading space) rather than dropped."""
+    tok = (tok or "").replace("\n", "⏎").replace("\t", " ").replace(" ", "·")
+    return tok[:10]
+
+
+class _LogitTap:
+    """A llama.cpp logits_processor that records a cheap per-token activity
+    trace straight from each generated token's logits — confidence (the softmax
+    probability of the most-likely token), the top-k candidate 'race', and the
+    normalised entropy over that set. Reads the logits only; returns them
+    unchanged so sampling is unaffected. Keeps just the tail of a long reply."""
+
+    def __init__(self, llm: "Llama") -> None:
+        self._llm = llm            # to detokenize candidate ids for display
+        self.trace: list = []
+
+    def __call__(self, input_ids, scores):
+        try:
+            logits = np.asarray(scores, dtype=np.float64)
+            k = min(_ACT_TOPK, logits.shape[-1])
+            top = np.argpartition(logits, -k)[-k:]
+            top = top[np.argsort(logits[top])[::-1]]      # highest logit first
+            m = float(logits.max())
+            ex = np.exp(logits - m)
+            z = float(ex.sum()) or 1.0
+            probs = (ex[top] / z)
+            klist = [[self._detok(int(t)), round(float(pr), 4)]
+                     for t, pr in zip(top.tolist(), probs.tolist())]
+            # normalised entropy over the (renormalised) top-k
+            ent, s = 0.0, float(probs.sum())
+            if s > 0.0 and k > 1:
+                q = probs / s
+                ent = float(-(q * np.log(np.clip(q, 1e-12, 1.0))).sum() / math.log(k))
+            self.trace.append({
+                "t": klist[0][0],
+                "p": round(float(probs[0]), 4),
+                "e": round(min(1.0, max(0.0, ent)), 4),
+                "k": klist,
+            })
+            if len(self.trace) > _ACT_MAX_TOKENS:
+                del self.trace[0]
+        except Exception:
+            pass
+        return scores
+
+    def _detok(self, tid: int) -> str:
+        try:
+            return _clean_token(self._llm.detokenize([tid]).decode("utf-8",
+                                                                    "replace"))
+        except Exception:
+            return "?"
+
+
 def _date_note() -> str:
     """A system-prompt fragment anchoring the model in the current date."""
     today = datetime.datetime.now().strftime("%A, %B %d, %Y")
     return (
-        f"\n\nToday's date is {today}. Treat your own knowledge as possibly "
-        "out of date: for anything about current events, recent winners, "
-        "prices, or 'latest' things, use web_search and include the current "
-        "year in the query."
+        f"\n\nToday's date is {today}. Your training data is out of date, so you "
+        "do NOT reliably know the present state of the world. NEVER answer a "
+        "current-state question from your own memory — you MUST call web_search "
+        "first (include the current year in the query) and answer only from its "
+        "result. This is mandatory for: who currently holds any office or title "
+        "(president, prime minister, king, pope, CEO, champion, leader), who won "
+        "a recent election/match/award, current prices or standings, and "
+        "anything phrased with 'current', 'latest', 'now', or 'today'. A name you "
+        "remember (e.g. a president) is likely STALE — do not state it without "
+        "searching. If a question is built on a false premise (e.g. it asks for "
+        "the 'Prime Minister of the United States', an office that does not "
+        "exist), correct the premise instead of inventing an answer."
     )
 
 
@@ -120,25 +196,40 @@ class LLM:
                 [self.history[0], {"role": "system", "content": self._turn_memory}]
                 + self.history[1:]
             )
+        tap = _LogitTap(self.llm)
         resp = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=self.cfg.max_tokens,
             temperature=self.cfg.temperature,
             stream=False,
+            logits_processor=LogitsProcessorList([tap]),
         )
+        self._emit_activity(tap)
         return strip_think(resp["choices"][0]["message"].get("content") or "")
 
     # ---- primitives used by the agent orchestrator (agents.py) ----------
     def raw_complete(self, messages: list) -> str:
         """One non-streaming completion over an explicit message list (think
         stripped). Used for the planner/critic and as the worker's engine."""
+        tap = _LogitTap(self.llm)
         resp = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=self.cfg.max_tokens,
             temperature=self.cfg.temperature,
             stream=False,
+            logits_processor=LogitsProcessorList([tap]),
         )
+        self._emit_activity(tap)
         return strip_think(resp["choices"][0]["message"].get("content") or "")
+
+    def _emit_activity(self, tap: "_LogitTap") -> None:
+        """Publish this completion's logit trace to any UI (see ui_events).
+        Fully best-effort — visualisation must never affect generation."""
+        try:
+            if tap.trace:
+                ux.llm_activity(list(tap.trace))
+        except Exception:
+            pass
 
     def set_user_identity(self, name, role) -> None:
         """Tell the model who it's talking to (from the startup identity gate /

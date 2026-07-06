@@ -83,6 +83,30 @@ def ready() -> None:
     _emit("ready")
 
 
+def tool_activity(name: str, args: str = "", status: str = "run") -> None:
+    """A tool call is happening. `status` is one of:
+        "run"  — the tool has just started executing,
+        "ok"   — it finished successfully,
+        "fail" — it raised,
+        "deny" — it was blocked (e.g. an admin-only tool for a non-admin).
+    `args` is a short human-readable argument preview. Lets a UI show which
+    tool Atlas is reaching for right now. No-op with no UI."""
+    _emit("tool", name=str(name), args=str(args), status=str(status))
+
+
+def llm_activity(trace: list) -> None:
+    """Real per-token generation trace for the neural-activity panel.
+
+    `trace` is a list (in generation order) of dicts:
+        {"t": token, "p": confidence 0..1, "e": entropy 0..1,
+         "k": [[candidate_token, prob], ...]}
+    All values are derived from the model's own logits (softmax over the
+    next-token distribution) for the reply just generated — not decoration.
+    A UI can play the trace back to visualise how sure/uncertain the model was
+    token-by-token and which alternatives it weighed. No-op with no UI."""
+    _emit("llm", trace=trace)
+
+
 # ---- reverse channel: UI -> assistant (typed commands) ------------------
 _input_handler: Callable[[str], None] | None = None
 
