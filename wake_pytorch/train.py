@@ -149,9 +149,13 @@ def main() -> None:
                          positives=tts_va, real_positives=real_va,
                          real_negatives=rneg_va, real_frac=rf,
                          real_neg_frac=rnf, seed=args.seed + 1)
-    print(f"negatives[speech/music/noise/quiet]="
-          f"{len(train_ds.neg_speech)}/{len(train_ds.neg_music)}/"
-          f"{len(train_ds.neg_noise)}/{len(train_ds.neg_quiet)}", flush=True)
+    print(f"negatives[words/speech/music/noise/quiet]="
+          f"{len(train_ds.neg_words)}/{len(train_ds.neg_speech)}/"
+          f"{len(train_ds.neg_music)}/{len(train_ds.neg_noise)}/"
+          f"{len(train_ds.neg_quiet)}", flush=True)
+    if not train_ds.neg_words:
+        print("  note: no isolated-word negatives — run gen_negatives_tts.py to "
+              "stop false wakes on hello/hey/yellow/etc.", flush=True)
 
     dl_kw = dict(batch_size=args.batch, num_workers=args.workers,
                  pin_memory=(device == "cuda"),

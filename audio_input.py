@@ -44,7 +44,7 @@ def load_wake_model(cfg: Config) -> WakeDetector:
 
     Fully local — no downloads. See wake_pytorch/ for training and export.
     """
-    return WakeDetector(cfg.wake_model)
+    return WakeDetector(cfg.wake_model, min_rms=getattr(cfg, "wake_min_rms", 0.0))
 
 
 def wait_for_wake_word(stream: MicLike, oww: WakeDetector, cfg: Config,

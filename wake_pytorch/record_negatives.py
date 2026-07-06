@@ -41,13 +41,31 @@ MIN_VOICED_FRAC = 0.15                 # drop near-silent windows
 
 # The HARDEST negatives: words/phrases that sound like "Atlas" (/ˈæt.ləs/) but
 # aren't the wake word. Reading these in YOUR voice teaches the model the precise
-# boundary of the wake word. NEVER say the actual word "Atlas". Shown a few per
-# take so you can read them as a short list.
+# boundary of the wake word. NEVER say the actual word "Atlas". Ordered nearest-
+# first (in phonetic groups) so even a short session covers the most confusable
+# ones; shown 4 per take AND printed in full at startup.
 CONFUSABLES = [
-    "at last", "a class", "at us", "add less", "hatless", "artless",
-    "cutlass", "callous", "Dallas", "Wallace", "palace", "malice",
-    "chalice", "solace", "atlantic", "atlanta", "actress", "cactus",
-    "access", "practice", "flatlands", "matches", "lattice", "notice",
+    # nearest — "at + l..s"
+    "at last", "outlast", "ballast", "at us", "add less", "a class", "at less",
+    # -tless / -tlas
+    "hatless", "artless", "flatlands", "cutlass",
+    # callous / Dallas family
+    "callous", "Dallas", "Wallace", "Pallas", "gallows", "palace",
+    # malice / chalice family
+    "malice", "chalice", "Alice", "trellis", "necklace",
+    # solace / jealous family
+    "solace", "jealous", "zealous", "careless", "reckless", "restless",
+    # cactus / lattice family
+    "cactus", "lettuce", "lattice", "practice", "notice", "novice", "office",
+    # at- / atl- onset
+    "atlantic", "atlanta", "athlete", "atmosphere", "actress",
+    # -less family (reported live triggers: hopeless/at least/etc.)
+    "at least", "hopeless", "helpless", "homeless", "harmless", "aimless",
+    "endless", "clueless", "hapless", "a list",
+    # arctic / antarctica family (reported live triggers)
+    "arctic", "antarctica", "antarctic", "atlantis", "attic",
+    # misc near
+    "access", "matches",
 ]
 
 # Ordinary conversational speech — general non-wake negatives.
@@ -159,7 +177,11 @@ def main() -> None:
     stream.start()
     print(f"\nRecording ~{args.takes} spoken takes (NOT the word 'Atlas'). "
           f"Mic: {sd.query_devices(args.device, 'input')['name']}")
-    print("Press Enter, read the prompt aloud, pause when done. "
+    print(f"\nAll {len(CONFUSABLES)} sound-alike words you'll read "
+          "(NEVER say 'Atlas' itself):")
+    for i in range(0, len(CONFUSABLES), 6):
+        print("    " + "   ".join(f"{w:<11}" for w in CONFUSABLES[i:i + 6]))
+    print("\nPress Enter, read the prompt aloud, pause when done. "
           "('r'=redo last, 'q'=quit)\n")
 
     saved_windows = 0

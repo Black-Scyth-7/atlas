@@ -30,8 +30,17 @@ except ImportError:  # imported as a top-level module
 
 
 class WakeDetector:
-    def __init__(self, model_path: str, providers: list[str] | None = None):
+    def __init__(self, model_path: str, providers: list[str] | None = None,
+                 min_rms: float = 0.0):
         self.model_path = str(model_path)
+        # Speech-energy gate: a wake must fire ON an audible frame. Without this
+        # the model over-confidently scores the QUIET DECAY TAIL of any preceding
+        # sound — a word ends, its energy scrolls to the edge of the rolling 1.5 s
+        # window, and a near-silent frame (rms ~0.009) reads as "Atlas". Real
+        # "Atlas" always fires on the loud burst (rms >0.05), so requiring the
+        # current frame's RMS >= min_rms rejects those tail/transient false wakes
+        # with a wide margin. 0.0 disables the gate (raw model behaviour).
+        self.min_rms = float(min_rms)
         self.sess = ort.InferenceSession(
             self.model_path,
             providers=providers or ["CPUExecutionProvider"])
@@ -43,12 +52,20 @@ class WakeDetector:
         self._buf[:] = 0
 
     def predict(self, chunk: np.ndarray) -> float:
-        """Append an int16 mono chunk and return P("Atlas") over the last 1.5 s."""
+        """Append an int16 mono chunk and return P("Atlas") over the last 1.5 s.
+
+        Returns 0.0 for frames quieter than `min_rms` (see __init__): the rolling
+        window still advances, but a silent frame can never trigger a wake.
+        """
         chunk = np.asarray(chunk).reshape(-1).astype(np.int16)
         if chunk.shape[0] >= WINDOW_SAMPLES:
             self._buf = chunk[-WINDOW_SAMPLES:].copy()
         else:
             self._buf = np.concatenate([self._buf[chunk.shape[0]:], chunk])
+        if self.min_rms > 0.0:
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) / 32768.0
+            if rms < self.min_rms:
+                return 0.0
         feat = mfcc(self._buf).unsqueeze(0).numpy().astype(np.float32)  # (1,64,frames)
         prob = self.sess.run(None, {self._in: feat})[0]
         return float(np.asarray(prob).reshape(-1)[0])
