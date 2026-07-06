@@ -24,7 +24,10 @@ from __future__ import annotations
 import math
 import os
 import random
+import subprocess
 import sys
+import threading
+import time
 import traceback
 from collections import deque
 
@@ -72,6 +75,8 @@ class Bridge(QObject):
     status = Signal(dict)
     mode = Signal(bool)
     ready = Signal()
+    llm = Signal(list)
+    tool = Signal(str, str, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -94,6 +99,11 @@ class Bridge(QObject):
             self.mode.emit(bool(data.get("on")))
         elif kind == "ready":
             self.ready.emit()
+        elif kind == "llm":
+            self.llm.emit(data.get("trace", []))
+        elif kind == "tool":
+            self.tool.emit(data.get("name", ""), data.get("args", ""),
+                           data.get("status", "run"))
 
 
 # ---- dark, bokeh-lit background field -----------------------------------
@@ -302,6 +312,301 @@ class NetworkCard(HudCard):
             p.drawEllipse(px - 7, py - 7, 14, 14)
             p.setBrush(QColor(160, 200, 225, 200))
             p.drawEllipse(px - 2.4, py - 2.4, 4.8, 4.8)
+
+
+def _conf_color(p: float) -> tuple[int, int, int]:
+    """Map a probability/confidence 0..1 to a colour: red (uncertain) through
+    amber to cyan (confident). Used for the live logit readout."""
+    p = max(0.0, min(1.0, p))
+    if p < 0.5:
+        f = p / 0.5
+        return (228, int(96 + 120 * f), 96)
+    f = (p - 0.5) / 0.5
+    return (int(228 - 150 * f), int(216 - 8 * f), int(96 + 140 * f))
+
+
+class NeuralActivityCard(HudCard):
+    """LIVE, REAL model telemetry — not decoration.
+
+    Plays back the per-token logit trace emitted by llm.py for the reply Atlas
+    just generated (see ui_events.llm_activity). Shows three genuine signals:
+      • a confidence heat-strip of the most recent tokens (green = the model was
+        sure, red = uncertain),
+      • the top-k candidate 'race' for the current token — the actual
+        alternatives the model weighed, with their probabilities,
+      • a running confidence/entropy readout.
+    With no trace yet it rests on a dim flatline."""
+
+    def _seed(self) -> None:
+        self.trace: list = []
+        self._cursor = 0.0          # playback head (tokens)
+        self._speed = 0.5           # tokens advanced per frame (~lively)
+
+    def set_trace(self, trace: list) -> None:
+        self.trace = trace or []
+        self._cursor = 0.0
+
+    def tick(self) -> None:
+        self.phase += 0.03
+        if self.trace:
+            self._cursor = min(self._cursor + self._speed, len(self.trace) - 1)
+        self.update()
+
+    def draw_content(self, p, x, y, w, h) -> None:
+        if not self.trace:
+            self._draw_resting(p, x, y, w, h)
+            return
+        idx = max(0, min(int(self._cursor), len(self.trace) - 1))
+        cur = self.trace[idx]
+
+        # --- header: current token + confidence + entropy ---
+        p.setFont(QFont("Consolas", 7, QFont.Bold))
+        conf = float(cur.get("p", 0.0))
+        p.setPen(QColor(120, 175, 205, 210))
+        p.drawText(int(x), int(y + 9),
+                   f"tok \"{cur.get('t', '')}\"")
+        cr, cg, cb = _conf_color(conf)
+        p.setPen(QColor(cr, cg, cb, 235))
+        p.drawText(int(x), int(y + 20),
+                   f"p={conf*100:4.0f}%  H={float(cur.get('e', 0.0)):.2f}")
+
+        # --- confidence heat-strip: a window of recent tokens up to the head ---
+        strip_y = y + 26
+        strip_h = 12
+        win = 20
+        lo = max(0, idx - win + 1)
+        cells = self.trace[lo:idx + 1]
+        if cells:
+            cw = w / win
+            for i, tk in enumerate(cells):
+                pv = float(tk.get("p", 0.0))
+                r, g, b = _conf_color(pv)
+                bx = x + i * cw
+                newest = (lo + i == idx)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(r, g, b, 235 if newest else 150))
+                p.drawRect(QRectF(bx, strip_y, max(1.0, cw - 1.5), strip_h))
+                if newest:
+                    p.setBrush(QColor(230, 245, 255, 230))
+                    p.drawRect(QRectF(bx, strip_y, max(1.0, cw - 1.5), 2))
+
+        # --- candidate 'race' for the current token ---
+        cands = cur.get("k", [])[:5]
+        top = y + 44
+        avail = (y + h) - top - 2
+        if cands and avail > 8:
+            rh = min(15.0, avail / len(cands))
+            label_w = 44.0
+            bar_x = x + label_w
+            bar_w = max(10.0, w - label_w - 26)
+            p.setFont(QFont("Consolas", 7))
+            for i, cand in enumerate(cands):
+                tok = str(cand[0]) if cand else ""
+                prob = float(cand[1]) if len(cand) > 1 else 0.0
+                ry = top + i * rh
+                chosen = (tok == cur.get("t", "")) or (i == 0 and tok == "")
+                r, g, b = _conf_color(prob)
+                # token label
+                p.setPen(QColor(200, 225, 240, 230) if chosen
+                         else QColor(110, 155, 180, 190))
+                p.drawText(int(x), int(ry + rh - 3), f"{tok:<6.6}")
+                # track + bar
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(40, 70, 95, 90))
+                p.drawRect(QRectF(bar_x, ry + 1, bar_w, rh - 3))
+                p.setBrush(QColor(r, g, b, 235 if chosen else 165))
+                p.drawRect(QRectF(bar_x, ry + 1, bar_w * max(0.0, min(1.0, prob)),
+                                  rh - 3))
+                # probability %
+                p.setPen(QColor(r, g, b, 220))
+                p.drawText(int(bar_x + bar_w + 3), int(ry + rh - 3),
+                           f"{prob*100:2.0f}")
+
+    def _draw_resting(self, p, x, y, w, h) -> None:
+        """No trace yet — a calm scanning flatline."""
+        cy = y + h / 2
+        pen = QPen(QColor(*BLUE, 70)); pen.setWidthF(1.0)
+        p.setPen(pen)
+        prev = None
+        for i in range(0, int(w), 4):
+            v = math.sin(i * 0.08 + self.phase * 2.0) * 2.0
+            pt = (x + i, cy + v)
+            if prev:
+                p.drawLine(prev[0], prev[1], pt[0], pt[1])
+            prev = pt
+        sweep = (self.phase * 40) % (w + 20) - 10
+        p.setPen(Qt.NoPen)
+        g = QRadialGradient(x + sweep, cy, 10)
+        g.setColorAt(0.0, QColor(150, 195, 225, 170))
+        g.setColorAt(1.0, QColor(*CYAN, 0))
+        p.setBrush(g)
+        p.drawEllipse(x + sweep - 10, cy - 10, 20, 20)
+        p.setFont(QFont("Consolas", 7))
+        p.setPen(QColor(80, 130, 165, 150))
+        p.drawText(int(x), int(y + h - 3), "awaiting inference…")
+
+
+class SystemResourceCard(HudCard):
+    """LIVE system load — real telemetry, not decoration.
+
+    CPU / RAM / GPU / VRAM utilisation as eased bars. Readings are gathered on a
+    daemon background thread (psutil for CPU+RAM, `nvidia-smi` for the GPU) so
+    the GUI thread never blocks on a subprocess; the bars glide toward the
+    latest values. Bars warm from cyan → amber → red as load climbs."""
+
+    _ROWS = (("CPU", "cpu"), ("RAM", "ram"), ("GPU", "gpu"), ("VRAM", "vram"))
+    _POLL_S = 1.5
+
+    def _seed(self) -> None:
+        self._target = {k: 0.0 for _, k in self._ROWS}
+        self._disp = {k: 0.0 for _, k in self._ROWS}
+        self._gpu_ok = True
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    # ---- background sampling (never touches Qt) ----
+    def _poll_loop(self) -> None:
+        try:
+            import psutil
+        except Exception:
+            psutil = None
+        if psutil is not None:
+            try:
+                psutil.cpu_percent(interval=None)      # prime the delta counter
+            except Exception:
+                pass
+        while True:
+            if psutil is not None:
+                try:
+                    self._target["cpu"] = psutil.cpu_percent(interval=None) / 100.0
+                    self._target["ram"] = psutil.virtual_memory().percent / 100.0
+                except Exception:
+                    pass
+            self._poll_gpu()
+            time.sleep(self._POLL_S)
+
+    def _poll_gpu(self) -> None:
+        if not self._gpu_ok:
+            return
+        try:
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2.5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            util, used, total = (float(v) for v in
+                                 out.stdout.strip().splitlines()[0].split(","))
+            self._target["gpu"] = max(0.0, min(1.0, util / 100.0))
+            self._target["vram"] = max(0.0, min(1.0, used / total)) if total else 0.0
+        except Exception:
+            self._gpu_ok = False       # no usable GPU readout — leave those bars at 0
+
+    # ---- render ----
+    def tick(self) -> None:
+        self.phase += 0.03
+        for k in self._disp:
+            self._disp[k] += (self._target[k] - self._disp[k]) * 0.15
+        self.update()
+
+    def draw_content(self, p, x, y, w, h) -> None:
+        rh = h / len(self._ROWS)
+        label_w, val_w = 36.0, 32.0
+        bar_x = x + label_w
+        bar_w = max(10.0, w - label_w - val_w)
+        p.setFont(QFont("Consolas", 7, QFont.Bold))
+        for i, (lab, key) in enumerate(self._ROWS):
+            v = max(0.0, min(1.0, self._disp[key]))
+            cy = y + i * rh + rh / 2
+            r, g, b = _conf_color(1.0 - v)      # more load -> warmer/red
+            p.setPen(QColor(120, 175, 205, 210))
+            p.drawText(int(x), int(cy + 3), lab)
+            bh = min(9.0, rh - 8)
+            by = cy - bh / 2
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(40, 70, 95, 90))
+            p.drawRect(QRectF(bar_x, by, bar_w, bh))
+            p.setBrush(QColor(r, g, b, 225))
+            p.drawRect(QRectF(bar_x, by, bar_w * v, bh))
+            p.setBrush(QColor(220, 245, 255, 210))
+            p.drawRect(QRectF(bar_x + bar_w * v - 1.0, by, 2.0, bh))  # leading edge
+            p.setPen(QColor(r, g, b, 235))
+            p.drawText(int(bar_x + bar_w + 4), int(cy + 3), f"{v * 100:3.0f}%")
+
+
+class ToolActivityCard(HudCard):
+    """LIVE tool-call readout — real, not decoration.
+
+    Shows which tool Atlas is reaching for right now (see ui_events.tool_activity
+    / Tools.execute): the current tool name with a status dot that pulses amber
+    while running and settles green (ok), red (fail) or orange (denied), its
+    argument preview, and a short log of recent calls. Rests when idle."""
+
+    _COLORS = {"run": (230, 180, 90), "ok": (120, 210, 150),
+               "fail": (230, 110, 90), "deny": (215, 150, 80)}
+    _GLYPH = {"run": "▶", "ok": "✓", "fail": "✗", "deny": "⊘"}
+
+    def _seed(self) -> None:
+        self.current: dict | None = None
+        self.history: deque = deque(maxlen=4)   # (name, status) most-recent last
+
+    def set_tool(self, name: str, args: str, status: str) -> None:
+        self.current = {"name": name, "args": args, "status": status}
+        if status in ("ok", "fail", "deny"):
+            self.history.append((name, status))
+
+    def _sc(self, status: str) -> tuple[int, int, int]:
+        return self._COLORS.get(status, (120, 175, 205))
+
+    def draw_content(self, p, x, y, w, h) -> None:
+        if self.current is None:
+            p.setFont(QFont("Consolas", 8))
+            p.setPen(QColor(80, 130, 165, 150))
+            p.drawText(int(x), int(y + h / 2), "idle — no tool calls yet")
+            return
+
+        cur = self.current
+        r, g, b = self._sc(cur["status"])
+        # --- status dot (pulses while running) ---
+        pulse = 0.55 + 0.45 * math.sin(self.phase * 4.0) if cur["status"] == "run" else 1.0
+        dot_r = 4.0
+        dcx, dcy = x + dot_r + 1, y + 9
+        gg = QRadialGradient(dcx, dcy, dot_r * 3)
+        gg.setColorAt(0.0, QColor(r, g, b, int(200 * pulse)))
+        gg.setColorAt(1.0, QColor(r, g, b, 0))
+        p.setPen(Qt.NoPen); p.setBrush(gg)
+        p.drawEllipse(dcx - dot_r * 3, dcy - dot_r * 3, dot_r * 6, dot_r * 6)
+        p.setBrush(QColor(r, g, b, int(120 + 135 * pulse)))
+        p.drawEllipse(dcx - dot_r, dcy - dot_r, 2 * dot_r, 2 * dot_r)
+
+        # --- current tool name ---
+        p.setFont(QFont("Consolas", 10, QFont.Bold))
+        p.setPen(QColor(min(255, r + 40), min(255, g + 40), min(255, b + 40), 240))
+        p.drawText(int(dcx + dot_r + 6), int(dcy + 4), str(cur["name"]))
+
+        # --- argument preview ---
+        if cur["args"]:
+            p.setFont(QFont("Consolas", 7))
+            p.setPen(QColor(110, 155, 180, 190))
+            p.drawText(int(x), int(y + 24), str(cur["args"]))
+
+        # --- recent-call log ---
+        top = y + 38
+        if self.history and top < y + h - 6:
+            p.setFont(QFont("Consolas", 7, QFont.Bold))
+            p.setPen(QColor(73, 113, 134, 190))
+            p.drawText(int(x), int(top), "RECENT")
+            p.setFont(QFont("Consolas", 7))
+            ly = top + 12
+            for name, status in reversed(self.history):
+                if ly > y + h - 2:
+                    break
+                cr, cg, cb = self._sc(status)
+                p.setPen(QColor(cr, cg, cb, 220))
+                p.drawText(int(x), int(ly), self._GLYPH.get(status, "·"))
+                p.setPen(QColor(150, 185, 205, 200))
+                p.drawText(int(x + 12), int(ly), str(name)[:20])
+                ly += 12
 
 
 class BarsCard(HudCard):
@@ -702,17 +1007,19 @@ class AtlasWindow(QMainWindow):
 
         # decorative panels flanking the atom (2 columns each side, 3 rows)
         self._cards = [
-            MoleculeCard("Structure α", seed=1),
+            SystemResourceCard("System load", seed=1),
             BarsCard("Signal", seed=2),
             RadarCard("Scan α", seed=3),
-            MoleculeCard("Structure β", seed=4),
-            NetworkCard("Neural net", seed=5),
+            ToolActivityCard("Tool activity", seed=4),
+            NeuralActivityCard("LLM · logits", seed=5),
             TelemetryCard("Telemetry", seed=6),
             MoleculeCard("Structure γ", seed=7),
             CubeCard("Lattice", seed=8),
             RadarCard("Scan β", seed=9),
         ]
         c = self._cards
+        self.neural = c[4]          # the live logit panel (real model telemetry)
+        self.tools_card = c[3]      # the live tool-call panel
         # left block (cols 0,1)
         grid.addWidget(c[0], 0, 0); grid.addWidget(c[3], 0, 1)
         grid.addWidget(c[1], 1, 0); grid.addWidget(c[4], 1, 1)
@@ -767,6 +1074,8 @@ class AtlasWindow(QMainWindow):
         self.bridge.status.connect(self._on_status)
         self.bridge.mode.connect(self._on_mode)
         self.bridge.ready.connect(self._reveal)
+        self.bridge.llm.connect(self.neural.set_trace)
+        self.bridge.tool.connect(self.tools_card.set_tool)
         self._on_state("idle")
 
     def _reveal(self) -> None:
