@@ -552,6 +552,46 @@ def _open_url(url: str) -> None:
         webbrowser.open(url)
 
 
+# Known browsers -> candidate executable locations (expanded at lookup time).
+# Aliases fold spoken variants ("google chrome", "brave browser") onto a key.
+_BROWSER_PATHS = {
+    "brave": [r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe",
+              r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+              r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe"],
+    "chrome": [r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+               r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+               r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"],
+    "firefox": [r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+                r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"],
+    "edge": [r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+             r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"],
+    "opera": [r"%LOCALAPPDATA%\Programs\Opera\launcher.exe"],
+    "operagx": [r"%LOCALAPPDATA%\Programs\Opera GX\launcher.exe"],
+}
+_BROWSER_ALIASES = {
+    "google chrome": "chrome", "chrome browser": "chrome",
+    "brave browser": "brave", "microsoft edge": "edge", "ms edge": "edge",
+    "mozilla": "firefox", "mozilla firefox": "firefox", "firefox browser": "firefox",
+    "opera gx": "operagx",
+}
+
+
+def _find_browser(name: str):
+    """Resolve a spoken browser name to (exe_path, canonical_key), or (None, key)."""
+    import shutil
+
+    key = (name or "").strip().lower()
+    key = _BROWSER_ALIASES.get(key, key)
+    key = re.sub(r"\s*browser$", "", key).strip()   # 'brave browser' -> 'brave'
+    key = _BROWSER_ALIASES.get(key, key)
+    for cand in _BROWSER_PATHS.get(key, []):
+        path = os.path.expandvars(cand)
+        if os.path.exists(path):
+            return path, key
+    exe = shutil.which(key) or shutil.which(key + ".exe")
+    return exe, key
+
+
 def _youtube_top_video(query: str):
     """Return the first videoId for a YouTube search query, or None."""
     search_url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
@@ -611,12 +651,41 @@ def play_youtube(query: str) -> str:
     return f"Opened a YouTube search for {query}."
 
 
-def open_website(url: str) -> str:
+def open_website(url: str, browser: str = "") -> str:
     url = url.strip()
     if not re.match(r"^https?://", url, re.IGNORECASE):
         url = "https://" + url
+    if browser:
+        exe, key = _find_browser(browser)
+        if not exe:
+            _open_url(url)
+            return (f"I couldn't find the {browser} browser installed, so I "
+                    f"opened {url} in the default browser instead.")
+        try:
+            import subprocess
+            subprocess.Popen([exe, url])
+            return f"Opening {url} in {key.capitalize()}."
+        except Exception as e:
+            _open_url(url)
+            return (f"I couldn't launch {browser} ({e}); opened {url} in the "
+                    "default browser instead.")
     _open_url(url)
     return f"Opening {url}."
+
+
+def close_website(name: str) -> str:
+    """Close the browser window/tab currently showing a website.
+
+    Accepts a URL, a domain, or a bare site label ('github', 'youtube.com',
+    'https://x.com/foo'). Reports the REAL result — it never claims success
+    without actually signalling a window to close."""
+    raw = name.strip()
+    if not raw:
+        return "No website given."
+    keyword = _site_keyword(raw) if ("." in raw or "/" in raw) else raw.lower()
+    if _close_browser_windows(keyword):
+        return f"Closed the browser tab showing {keyword}."
+    return f"I don't see {keyword} open in a browser."
 
 
 def lock() -> str:

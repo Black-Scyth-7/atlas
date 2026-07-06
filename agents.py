@@ -21,11 +21,48 @@ instance (`raw_complete`) and the shared `Tools` registry (`parse` / `execute`).
 
 from __future__ import annotations
 
+import datetime
 import re
 from typing import Optional
 
 _CONTINUE = ("If the task is now complete, reply to the user in one short "
              "plain-text sentence (no JSON). Otherwise call the next tool.")
+
+# --- Freshness router -------------------------------------------------------
+# Some questions have answers that change over time (who holds an office, who
+# won, current prices). A small local model answers these confidently from its
+# STALE training weights and never chooses to search — so we don't leave it to
+# the model. When a question matches, we force a web_search up front and hand
+# the result to the model as authoritative context (see Orchestrator._forced_
+# search). Kept deliberately tight so ordinary questions aren't slowed down.
+_OFFICE_RE = re.compile(
+    r"\b(president|vice[-\s]?president|prime[-\s]?minister|pm|premier|"
+    r"chancellor|king|queen|monarch|emperor|empress|pope|ceo|"
+    r"chair(?:man|woman|person)?|governor|mayor|senator|"
+    r"chief\s+minister|chief\s+justice|secretary\s+of\s+state|"
+    r"head\s+of\s+(?:state|government)|leader)\b", re.IGNORECASE)
+_FRESH_RE = re.compile(
+    r"\b(current(?:ly)?|latest|most\s+recent|right\s+now|as\s+of\s+(?:now|"
+    r"today)|nowadays|these\s+days|today'?s|this\s+(?:year|month|week))\b",
+    re.IGNORECASE)
+_WHO_IS_RE = re.compile(r"\bwho(?:\s*'?s|\s+is|\s+are|\s+was|\s+were)\b",
+                        re.IGNORECASE)
+_WHO_WON_RE = re.compile(r"\bwho\s+(?:won|is\s+winning|leads|is\s+leading)\b",
+                         re.IGNORECASE)
+# Any question stem — a "current/latest ..." phrasing paired with one of these
+# is time-sensitive regardless of whether it's a "who" question.
+_ASK_RE = re.compile(r"\b(who|what|what'?s|which|where|when|whom|"
+                     r"how\s+(?:much|many))\b", re.IGNORECASE)
+# Relative dates ("yesterday's match", "last night") mark a query as being about
+# recent events — time-sensitive even with no question word. Paired with a
+# results/scores noun (below) they force a live search the model wouldn't run.
+_RELDATE_RE = re.compile(
+    r"\b(yesterday|last\s+night|day\s+before\s+yesterday|today'?s?|tonight|"
+    r"this\s+(?:morning|afternoon|evening))\b", re.IGNORECASE)
+_RESULT_RE = re.compile(
+    r"\b(scores?|scored|results?|final|won|win(?:ner|ning)?|beat|standings?|"
+    r"fixtures?|matches?|match|games?|race|tournament|championship)\b",
+    re.IGNORECASE)
 
 # A run_command that deletes files still asks first (there's no dedicated
 # delete-file tool, so deletions happen through the shell). Matches a delete
@@ -80,7 +117,15 @@ _ACTION_CLAIM = re.compile(
     r"(?:volume|brightness)|muted|unmuted|increased|decreased|adjusted|lowered|"
     r"raised|took (?:a )?screenshot|captured|typed|pressed|clicked|scrolled|"
     r"moved the (?:mouse|cursor)|played|paused|skipped|locked|brightened|"
-    r"dimmed|maximi[sz]ed|minimi[sz]ed|done\b)", re.IGNORECASE)
+    r"dimmed|maximi[sz]ed|minimi[sz]ed|done\b|"
+    # State-of-the-world claims the model narrates instead of acting, e.g.
+    # "Facebook is now open in your browser" — no past-tense verb, so caught
+    # here. Gated by "now" or a browser/tab context so factual answers
+    # ("the store is open until 9pm") don't trip the guard.
+    r"(?:is|are|it'?s|they'?re) (?:now )?(?:open|running|launched|playing)|"
+    r"now (?:open|running|launched|playing)|"
+    r"(?:open|opened|running|launched|playing) in (?:your|the) (?:browser|tab))",
+    re.IGNORECASE)
 
 
 def _claims_action(text: str) -> bool:
@@ -140,6 +185,49 @@ class Orchestrator:
         if getattr(self.llm.cfg, "disable_thinking", False):
             sys += " /no_think"
         return sys
+
+    # ---- freshness router -----------------------------------------------
+    @staticmethod
+    def _needs_fresh_data(text: str) -> bool:
+        """True if `text` asks about something that changes over time and so must
+        be answered from a live web_search, not the model's stale weights."""
+        t = text or ""
+        if _WHO_WON_RE.search(t):
+            return True
+        if _OFFICE_RE.search(t) and (_WHO_IS_RE.search(t) or _FRESH_RE.search(t)):
+            return True
+        if _FRESH_RE.search(t) and _ASK_RE.search(t):
+            return True
+        # "score of yesterday's match", "who won last night" — recent-event
+        # queries that often carry no question word for _ASK_RE to catch.
+        if _RELDATE_RE.search(t) and (_ASK_RE.search(t) or _RESULT_RE.search(t)):
+            return True
+        return False
+
+    def _forced_search(self, user_text: str) -> str:
+        """For a time-sensitive question, run web_search now and return an
+        authoritative context note the model must answer from. '' if it doesn't
+        apply, web_search isn't available, or the search failed."""
+        if self.tools is None or "web_search" not in getattr(
+                self.tools, "_registry", {}):
+            return ""
+        if not self._needs_fresh_data(user_text):
+            return ""
+        query = f"{user_text.strip()} {datetime.datetime.now().year}"
+        try:
+            result = self.tools.execute(
+                {"name": "web_search", "arguments": {"query": query}})
+        except Exception:
+            return ""
+        print(f"  · web_search(forced) -> {result}", flush=True)
+        if not result or result.startswith("Web search is unavailable"):
+            return ""
+        return (
+            "Authoritative, up-to-date web_search result for the user's "
+            "question. Answer ONLY from this — it overrides anything you "
+            "remember or think you know, which is likely stale. If it shows the "
+            "question's premise is wrong (e.g. an office that does not exist), "
+            f"say so.\n{result}")
 
     # ---- risk / confirmation --------------------------------------------
     def _needs_confirm(self, call: dict) -> bool:
@@ -278,6 +366,16 @@ class Orchestrator:
             # fresh request (falls through to a new task below).
 
         self._confirmed = None   # fresh request: re-enable confirmation
+
+        # Freshness router: for time-sensitive questions (current officeholders,
+        # who won, latest/current things) fetch live data up front rather than
+        # trusting the model's stale memory, and inject it as authoritative
+        # context. This guarantees fresh facts even if the model wouldn't have
+        # chosen to search on its own.
+        forced = self._forced_search(user_text)
+        if forced:
+            context = f"{context}\n\n{forced}" if context else forced
+
         messages = [{"role": "system", "content": self._system_prompt()}]
         # Recent conversation (no system msg) for continuity / "it"/"that" refs.
         messages += [m for m in self.llm.history[1:]]

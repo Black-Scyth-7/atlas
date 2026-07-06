@@ -25,6 +25,21 @@ from typing import Callable, Optional
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
+import ui_events as ux
+
+
+def _args_preview(args: dict, limit: int = 40) -> str:
+    """A short 'key=value, ...' summary of a tool's arguments for a UI readout."""
+    try:
+        parts = []
+        for k, v in (args or {}).items():
+            s = str(v).replace("\n", " ")
+            parts.append(f"{k}={s[:24]}")
+        preview = ", ".join(parts)
+        return preview[:limit] + ("…" if len(preview) > limit else "")
+    except Exception:
+        return ""
+
 
 def _key_from_mcp_url(url: str) -> str:
     """Pull the tavilyApiKey query param out of a Tavily MCP URL, if present."""
@@ -67,6 +82,14 @@ def _extract_json_objects(text: str) -> list[str]:
         else:
             start += 1
     return objects
+
+
+# A full desktop-browser User-Agent. DuckDuckGo's HTML results endpoint serves
+# an EMPTY page to terse/bot-looking agents (e.g. "Mozilla/5.0 (Atlas)") but
+# returns real results to a browser-looking one, so the keyless search fallback
+# needs this rather than the plain _http_get UA.
+_BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
 
 def _html_to_text(html: str) -> str:
@@ -187,6 +210,9 @@ class Tools:
         test_mode: bool = False,
         admin_only_tools=None,
         register_user_fn=None,
+        vault=None,
+        login_autofill_delay: float = 4.0,
+        use_cdp_login: bool = True,
     ):
         # Called when a timer elapses; main.py wires this to speak the alert.
         self._on_timer_fire = on_timer_fire or (lambda msg: print(f"\n{msg}"))
@@ -225,6 +251,11 @@ class Tools:
         # Callable(name, authority)->str that registers a new person live;
         # main.py wires it with the camera/mic/verifier (see auth.register_new_user).
         self._register_user_fn = register_user_fn
+
+        # Optional encrypted credential vault for website logins (see vault.py).
+        self._vault = vault
+        self._login_delay = float(login_autofill_delay)
+        self._use_cdp_login = bool(use_cdp_login)
 
         # web_search backend selection. The MCP URL embeds the API key, so it
         # also serves as a key source for the REST backend.
@@ -288,6 +319,45 @@ class Tools:
                 '{"name": "<person\'s name>", "authority": "user|guest"}',
             ),
         }
+
+        if vault is not None:
+            self._registry.update({
+                "save_login": (
+                    self._save_login,
+                    "Use when the user wants to SAVE/store their login or "
+                    "password for a website (e.g. 'save my gmail login', "
+                    "'remember my facebook password'). For security this does "
+                    "NOT take the password by voice — it returns terminal "
+                    "instructions the user follows to store it encrypted. Never "
+                    "ask for the password aloud; just call this with the site.",
+                    '{"site": "<website name or url, e.g. gmail>"}',
+                ),
+                "login": (
+                    self._login,
+                    "Log the user IN to a website using their saved vault "
+                    "credentials. Use whenever the user says to log in / sign "
+                    "in / 'log into <site>'. This actually opens the site and "
+                    "enters the saved username and password — do NOT claim you "
+                    "logged in yourself, and do NOT ask for the password (it's "
+                    "in the vault). If there's no saved login it will say so. If "
+                    "the user says to do it IN/ON a particular browser (Chrome, "
+                    "Brave, Firefox, Edge, Opera), put that in 'browser' — it is "
+                    "the browser to use, NOT the site. E.g. 'log into gmail on "
+                    "brave' -> site=gmail, browser=brave.",
+                    '{"site": "<site, e.g. gmail>", "browser": "<optional browser, e.g. brave>"}',
+                ),
+                "list_logins": (
+                    self._list_logins,
+                    "List which websites have a saved login in the vault. Never "
+                    "reveals usernames or passwords.",
+                    "{}",
+                ),
+                "forget_login": (
+                    self._forget_login,
+                    "Delete a saved website login from the vault.",
+                    '{"site": "<website name or url>"}',
+                ),
+            })
 
         if enable_self_extend:
             self._registry.update({
@@ -487,8 +557,26 @@ class Tools:
                 ),
                 "open_website": (
                     self._open_website,
-                    "Open a website in the browser.",
-                    '{"url": "<url or domain>"}',
+                    "Open a website in the browser. ALWAYS use this whenever the "
+                    "user asks to open/go to/visit/pull up a website, page, or "
+                    "domain. Do NOT claim you opened it yourself — this tool "
+                    "actually opens it and reports the real result. If the user "
+                    "says to open it IN/ON a specific browser (Chrome, Brave, "
+                    "Firefox, Edge, Opera), pass that as 'browser' — that name "
+                    "is the browser to use, NOT the site to open.",
+                    '{"url": "<url or domain>", "browser": "<optional browser, e.g. brave>"}',
+                ),
+                "close_website": (
+                    self._close_website,
+                    "Close a website / browser tab that is currently open (e.g. "
+                    "'close GitHub', 'close the YouTube tab', 'close that "
+                    "website'). ALWAYS use this whenever the user asks to "
+                    "close/exit/quit a website, web page, or browser tab — a site "
+                    "is NOT a desktop app, so use this and NOT close_app. Do NOT "
+                    "assume whether it's open or claim you closed it — this tool "
+                    "actually closes the matching browser window and reports the "
+                    "real result.",
+                    '{"name": "<website name, domain, or url, e.g. github or youtube.com>"}',
                 ),
                 "create_github_repo": (
                     self._create_github_repo,
@@ -749,16 +837,23 @@ class Tools:
     def execute(self, call: dict) -> str:
         """Run a parsed tool call and return a short text result."""
         name = call["name"]
+        args = call.get("arguments", {})
+        preview = _args_preview(args)
+        ux.tool_activity(name, preview, "run")
         # Authority gate: non-admins can't run admin-only tools. Test mode is
         # fully unrestricted (it bypasses auth entirely).
         if (not self._test_mode and self._authority != "admin"
                 and name in self._admin_only):
+            ux.tool_activity(name, preview, "deny")
             return (f"Sorry, '{name.replace('_', ' ')}' is an admin-only action "
                     f"and you're signed in as {self._authority}. Ask an admin.")
         handler = self._registry[name][0]
         try:
-            return handler(call.get("arguments", {}))
+            result = handler(args)
+            ux.tool_activity(name, preview, "ok")
+            return result
         except Exception as e:  # never let a tool crash the loop
+            ux.tool_activity(name, preview, "fail")
             return f"Tool '{name}' failed: {e}"
 
     # ---- tool implementations -------------------------------------------
@@ -1432,6 +1527,9 @@ class Tools:
         query = str(args.get("query", "")).strip()
         if not query:
             return "No search query provided."
+        # Resolve 'yesterday' / 'last night' / 'today' to real dates — a search
+        # engine can't anchor on a relative date and returns vague filler.
+        query = self._resolve_relative_dates(query)
 
         # Serve from cache if we've searched this recently.
         ck = None
@@ -1543,9 +1641,24 @@ class Tools:
 
         question = str(args.get("question", "")).strip() \
             or "Describe what is on the screen, concisely."
+        self._park_stt_for_vision()
         return self._vision.look(ImageGrab.grab(), question)
 
     # ---- vision-guided control ------------------------------------------
+    def _park_stt_for_vision(self) -> None:
+        """Free the STT model's VRAM before a vision inference so the CLIP image
+        encoder fits alongside the LLM on a small GPU (8 GB can't hold LLM + STT
+        + the vision encoder at once — it CUDA-aborts). STT reloads lazily on the
+        next transcribe(), so this is invisible in normal use."""
+        t = getattr(self, "_transcriber", None)
+        if t is not None and hasattr(t, "release"):
+            try:
+                if t.release():
+                    print("  · parked STT off GPU to free VRAM for vision",
+                          flush=True)
+            except Exception:
+                pass
+
     def _locate_on_screen(self, description: str):
         """Capture the screen, locate `description`, return (x_px, y_px, shot)
         in screenshot pixels — or (None, None, reason)."""
@@ -1555,6 +1668,7 @@ class Tools:
 
         if not description:
             return None, None, "What should I look for?"
+        self._park_stt_for_vision()
         shot = ImageGrab.grab()
         loc = self._vision.locate(shot, description)
         if not loc:
@@ -1612,6 +1726,7 @@ class Tools:
             return f"Couldn't access the camera: {e}"
         question = str(args.get("question", "")).strip() \
             or "Describe what the camera sees, concisely."
+        self._park_stt_for_vision()
         return self._vision.look(frame, question)
 
     def _take_photo(self, args: dict) -> str:
@@ -1729,8 +1844,279 @@ class Tools:
     def _open_website(self, args: dict) -> str:
         import system_control as sc
 
-        url = str(args.get("url", "")).strip()
-        return sc.open_website(url) if url else "No website given."
+        url = str(args.get("url") or args.get("site") or args.get("website")
+                  or "").strip()
+        browser = str(args.get("browser") or args.get("in") or "").strip()
+        return sc.open_website(url, browser) if url else "No website given."
+
+    def _close_website(self, args: dict) -> str:
+        import system_control as sc
+
+        # Accept name/url/site/website/domain — the model isn't always consistent.
+        name = str(args.get("name") or args.get("url") or args.get("site")
+                   or args.get("website") or args.get("domain") or "").strip()
+        return sc.close_website(name) if name else "No website given."
+
+    # ---- credential vault / website login -------------------------------
+    # Direct login-page URLs for common sites (the site root often doesn't show
+    # a login form). Falls back to the bare domain for anything not listed.
+    _LOGIN_URLS = {
+        "google": "https://accounts.google.com/ServiceLogin",
+        "facebook": "https://www.facebook.com/login",
+        "instagram": "https://www.instagram.com/accounts/login/",
+        "twitter": "https://twitter.com/login",
+        "x": "https://x.com/login",
+        "github": "https://github.com/login",
+        "linkedin": "https://www.linkedin.com/login",
+        "reddit": "https://www.reddit.com/login",
+        "netflix": "https://www.netflix.com/login",
+        "amazon": "https://www.amazon.com/ap/signin",
+    }
+
+    def _save_login(self, args: dict) -> str:
+        site = str(args.get("site") or args.get("website") or args.get("url")
+                   or args.get("name") or "").strip()
+        # Passwords must NEVER go through voice/STT/the model (they'd be mangled
+        # and would leak into logs/history), and blocking the voice loop on a
+        # hidden terminal prompt is unreliable — you can't see it while talking.
+        # So we direct the user to a dedicated terminal command that stores the
+        # credential encrypted, outside the conversation loop.
+        where = f' for {site}' if site else ""
+        return (f"For your security I don't take passwords by voice. To save "
+                f"your login{where}, open the terminal where Atlas is running "
+                f"and run:  python vault.py --set  — it'll ask for the site, "
+                f"username, and password (hidden) and store them encrypted. "
+                f"Then just say 'log into {site or 'the site'}'.")
+
+    def _vision_login(self, username: str, password: str, key: str):
+        """Log in using SCREEN VISION + mouse + keyboard: locate each field/
+        button on screen, click it, and type. Much more reliable than blind
+        typing (which needs the right field already focused).
+
+        Returns "ok" on a completed attempt, a message string if it got partway
+        but hit a wall, or None if it couldn't even find the first field (so the
+        caller falls back to blind keyboard autofill).
+        """
+        import time
+        import system_control as sc
+
+        def click(desc: str, settle: float = 0.5) -> bool:
+            x, y, err = self._locate_on_screen(desc)
+            if err:
+                return False
+            sc.mouse_click("left", x, y, False)
+            time.sleep(settle)
+            return True
+
+        if key == "google":
+            return self._vision_login_google(username, password, click)
+
+        # Generic single-page form: email field, then password, then submit.
+        if not click("the email, phone, or username login input text box"):
+            return None
+        sc.type_text(username)
+        time.sleep(0.3)
+        if not click("the password login input text box"):
+            sc.press_keys("tab")
+        sc.type_text(password)
+        time.sleep(0.3)
+        if not click("the Sign in or Log in submit button"):
+            sc.press_keys("enter")
+        return "ok"
+
+    def _vision_login_google(self, username, password, click):
+        """Google's flow has three possible first screens: an ACCOUNT CHOOSER
+        (the browser remembers accounts), a manual email-entry page, or — after
+        either — the password page. We resolve whichever is shown, driven by the
+        saved email, then enter the password."""
+        import time
+        import system_control as sc
+
+        time.sleep(0.6)  # let the page settle after the browser opens
+        if click(f'the account list row showing the email address "{username}"',
+                 settle=1.5):
+            # Picked a remembered account -> straight to its password page.
+            pass
+        elif click('the "Use another account" list option', settle=1.2):
+            # Chooser shown but our account isn't remembered -> manual entry.
+            time.sleep(self._login_delay)
+            if not click("the email or phone number input text box"):
+                return None
+            sc.type_text(username)
+            time.sleep(0.3)
+            if not click("the blue Next button"):
+                sc.press_keys("enter")
+        elif click("the email or phone number input text box", settle=1.0):
+            # No chooser — we're already on the email-entry page.
+            sc.type_text(username)
+            time.sleep(0.3)
+            if not click("the blue Next button"):
+                sc.press_keys("enter")
+        else:
+            return None  # can't recognize the page -> let caller fall back
+
+        time.sleep(self._login_delay)  # password page loads
+        if not click("the password input text box"):
+            return ("I got to Google's password step but couldn't find the "
+                    "password field — please type your password to finish.")
+        sc.type_text(password)
+        time.sleep(0.3)
+        if not click("the blue Next button"):
+            sc.press_keys("enter")
+        return "ok"
+
+    def _cdp_login(self, login_url: str, username: str, password: str,
+                   key: str, browser: str):
+        """Log in by driving a Chromium browser over the DevTools Protocol and
+        filling the form by DOM selector — fast and reliable, no vision/VRAM.
+
+        Needs `pip install playwright` (the Python lib only; we attach to the
+        real Brave/Chrome, no browser download). Returns None ONLY if playwright
+        isn't installed, so the caller can fall back to vision/keyboard; once
+        playwright is present this owns the attempt and always returns a string.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            return None
+        import os
+        import subprocess
+        import time
+        import urllib.request
+        import system_control as sc
+
+        port = 9222
+
+        def cdp_up() -> bool:
+            try:
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=1)
+                return True
+            except Exception:
+                return False
+
+        try:
+            if not cdp_up():
+                exe, _ = sc._find_browser(browser or "brave")
+                if not exe:
+                    return (f"I couldn't find the {browser or 'Brave'} browser "
+                            "to drive for login.")
+                profile = os.path.join(os.environ.get("LOCALAPPDATA", "."),
+                                       "atlas", "cdp-profile")
+                os.makedirs(profile, exist_ok=True)
+                subprocess.Popen([exe, f"--remote-debugging-port={port}",
+                                  f"--user-data-dir={profile}", login_url])
+                for _ in range(40):
+                    if cdp_up():
+                        break
+                    time.sleep(0.5)
+                else:
+                    return ("I launched the browser but its automation port "
+                            "didn't come up — try again in a moment.")
+
+            with sync_playwright() as p:
+                b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                ctx = b.contexts[0] if b.contexts else b.new_context()
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.goto(login_url, wait_until="domcontentloaded")
+                if key == "google":
+                    page.fill('input[type="email"]', username, timeout=20000)
+                    page.click('#identifierNext', timeout=8000)
+                    page.wait_for_selector('input[type="password"]',
+                                           state="visible", timeout=20000)
+                    page.fill('input[type="password"]', password)
+                    page.click('#passwordNext', timeout=8000)
+                else:
+                    page.fill('input[type="email"], input[name="username"], '
+                              'input[type="text"][name*="user" i]',
+                              username, timeout=20000)
+                    page.fill('input[type="password"]', password, timeout=20000)
+                    page.keyboard.press("Enter")
+                page.wait_for_timeout(3000)
+            return (f"I logged into {key} in {browser or 'the browser'} using "
+                    "your saved credentials. If it stopped for 2-step "
+                    "verification or a CAPTCHA, finish that step.")
+        except Exception as e:
+            return (f"I drove the browser but the login form didn't match "
+                    f"({e}). The page may have changed or needs 2-step "
+                    "verification — finish it manually.")
+
+    def _login(self, args: dict) -> str:
+        import time
+        import system_control as sc
+        import vault as vault_mod
+
+        site = str(args.get("site") or args.get("website") or args.get("url")
+                   or args.get("name") or "").strip()
+        if not site:
+            return "Which website should I log you into?"
+        try:
+            creds = self._vault.get_credential(site)
+        except Exception as e:
+            return f"I couldn't unlock the vault: {e}"
+        if creds is None:
+            return (f"I don't have a saved login for {site}. Say 'save my "
+                    f"{site} login' and I'll store it securely first.")
+        username, password = creds
+
+        browser = str(args.get("browser") or "").strip()
+        key = vault_mod._site_key(site)
+        login_url = self._LOGIN_URLS.get(key, key + ".com" if "." not in site
+                                         else site)
+
+        # Preferred: drive the browser DOM over CDP (fast, reliable, no VRAM).
+        # Returns None only if playwright isn't installed, in which case we fall
+        # back to the vision/keyboard path below.
+        if getattr(self, "_use_cdp_login", True):
+            cdp = self._cdp_login(login_url, username, password, key, browser)
+            if cdp is not None:
+                return cdp
+
+        open_msg = sc.open_website(login_url, browser)
+        time.sleep(self._login_delay)   # let the page load and render its form
+
+        # Prefer VISION-guided control: locate the fields/buttons on screen and
+        # click+type them. Blind keyboard typing (the fallback) only works if the
+        # right field is already focused, which Google's page often breaks.
+        status = None
+        if self._vision is not None and getattr(self._vision, "available", False):
+            status = self._vision_login(username, password, key)
+        if status is not None and status != "ok":
+            return status              # vision got partway but needs the user
+        if status is None:
+            # Fallback: blind keyboard autofill into the focused browser window.
+            if key == "google":
+                sc.type_text(username)
+                sc.press_keys("enter")
+                time.sleep(self._login_delay)
+                sc.type_text(password)
+                sc.press_keys("enter")
+            else:
+                sc.type_text(username)
+                sc.press_keys("tab")
+                sc.type_text(password)
+                sc.press_keys("enter")
+        where = f" in {browser}" if browser else ""
+        note = " (I couldn't find that browser, so I used your default one.)" \
+            if browser and "couldn't" in open_msg.lower() else ""
+        return (f"I opened {site}{where} and entered your saved login.{note} If "
+                "it didn't go through — a slow page, two-step verification, or a "
+                "CAPTCHA — just finish it manually.")
+
+    def _list_logins(self, args: dict) -> str:
+        sites = self._vault.list_sites()
+        if not sites:
+            return "You have no saved logins yet."
+        return "You have saved logins for: " + ", ".join(sites) + "."
+
+    def _forget_login(self, args: dict) -> str:
+        site = str(args.get("site") or args.get("website") or args.get("url")
+                   or args.get("name") or "").strip()
+        if not site:
+            return "Which website's login should I forget?"
+        if self._vault.delete_credential(site):
+            return f"I deleted your saved login for {site}."
+        return f"I don't have a saved login for {site}."
 
     def _create_github_repo(self, args: dict) -> str:
         import re
@@ -1974,6 +2360,30 @@ class Tools:
 
         return sc.power(str(args.get("action", "")), self._allow_power_off)
 
+    @staticmethod
+    def _resolve_relative_dates(query: str) -> str:
+        """Rewrite relative date words into absolute dates so a web search can
+        anchor on them. Engines can't resolve 'yesterday'/'last night', so
+        time-sensitive queries (scores, results) come back vague without this."""
+        import datetime as _dt
+
+        today = _dt.date.today()
+
+        def fmt(d: "_dt.date") -> str:
+            return f"{d.strftime('%B')} {d.day}, {d.year}"
+
+        subs = [
+            (r"\bday before yesterday(?:'s)?\b", today - _dt.timedelta(days=2)),
+            (r"\byesterday(?:'s)?\b", today - _dt.timedelta(days=1)),
+            (r"\blast night(?:'s)?\b", today - _dt.timedelta(days=1)),
+            (r"\b(?:today|tonight|this (?:morning|afternoon|evening))(?:'s)?\b",
+             today),
+        ]
+        out = query
+        for pattern, when in subs:
+            out = re.sub(pattern, fmt(when), out, flags=re.IGNORECASE)
+        return out
+
     def _run_web_search(self, query: str) -> str:
         # Try the preferred backend, then fall back to any others that are
         # available, so a bad key or a flaky endpoint never dead-ends a search.
@@ -2066,23 +2476,62 @@ class Tools:
         return f"No results for '{query}'."
 
     def _duckduckgo_search(self, query: str) -> str:
-        """Fallback search: DuckDuckGo Instant Answer API (no key needed)."""
-        url = (
-            "https://api.duckduckgo.com/?q="
-            + quote_plus(query)
-            + "&format=json&no_html=1&skip_disambig=1"
-        )
-        req = Request(url, headers={"User-Agent": "Atlas/1.0"})
-        with urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if data.get("AbstractText"):
-            return data["AbstractText"]
-        if data.get("Answer"):
-            return str(data["Answer"])
-        for topic in data.get("RelatedTopics", []):
-            if isinstance(topic, dict) and topic.get("Text"):
-                return topic["Text"]
+        """Fallback search (no key needed). Tries DuckDuckGo's Instant Answer API
+        first (a curated one-liner, good for definitions/facts it happens to
+        have), then falls back to scraping DuckDuckGo's real web results — which
+        the Instant Answer API lacks for most current-fact queries (current
+        officeholders, prices, 'who won'), the very questions this backend most
+        needs to answer."""
+        # 1) Instant Answer API — cheap, but sparse (empty for most queries).
+        try:
+            url = (
+                "https://api.duckduckgo.com/?q="
+                + quote_plus(query)
+                + "&format=json&no_html=1&skip_disambig=1"
+            )
+            req = Request(url, headers={"User-Agent": "Atlas/1.0"})
+            with urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("AbstractText"):
+                return data["AbstractText"]
+            if data.get("Answer"):
+                return str(data["Answer"])
+            for topic in data.get("RelatedTopics", []):
+                if isinstance(topic, dict) and topic.get("Text"):
+                    return topic["Text"]
+        except Exception:
+            pass  # fall through to real web results
+
+        # 2) Real web results — the top result snippets, for the LLM to condense.
+        snippets = self._ddg_html_snippets(query)
+        if snippets:
+            return " ".join(snippets)[:800]
         return f"No quick answer found for '{query}'."
+
+    @staticmethod
+    def _ddg_html_snippets(query: str) -> list:
+        """Scrape DuckDuckGo's HTML results page for the top result snippets.
+        Needs a browser User-Agent (see _BROWSER_UA) or the page comes back
+        empty. Returns [] on any failure so callers can fall back gracefully."""
+        import html as _h
+
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+        try:
+            req = Request(url, headers={"User-Agent": _BROWSER_UA})
+            with urlopen(req, timeout=12) as resp:
+                page = resp.read().decode("utf-8", "replace")
+        except Exception:
+            return []
+        out: list[str] = []
+        for raw in re.findall(r'class="result__snippet".*?>(.*?)</a>', page,
+                              re.DOTALL):
+            text = re.sub(r"<[^>]+>", " ", _h.unescape(raw))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                out.append(text)
+            if len(out) >= 3:
+                break
+        return out
 
     def cancel_all(self) -> None:
         """Cancel pending timers (call on shutdown)."""
