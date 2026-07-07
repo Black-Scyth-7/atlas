@@ -39,7 +39,8 @@ CLI). Everything else is local.
 | **Web & info** | Read/summarize a URL, weather, news, stock & crypto prices, translate, safe calculator, currency & unit conversion (free, no API keys). |
 | **System control** | Set system/per-app volume, screen brightness, take screenshots, lock/sleep/shutdown. |
 | **Media** | Play a song from YouTube; play/pause/next/previous of whatever's already playing; say what's now playing (Windows SMTC). |
-| **Apps & windows** | Open and close applications and websites. |
+| **Apps & windows** | Open and close applications and websites — optionally in a chosen browser (*"open GitHub in Brave"*). |
+| **Passwords & login** | Save website logins in an **encrypted vault** and sign you in on request (*"log into Gmail"*) — filling your real browser. Passwords are encrypted at rest (Windows DPAPI + optional master password), **never** stored in plaintext. |
 | **Keyboard & mouse** | Type text, press hotkeys, click/move/scroll the mouse — full input control. |
 | **Screen vision** | Look at the screen and answer questions about it (*"read this"*, *"what does this error say?"*) with a local vision model. |
 | **Vision-guided control** | Find a UI element by description and click/type into it (*"click the Save button"*) — operating apps it can see, not just ones with named tools. Best on large, labeled targets. |
@@ -126,7 +127,7 @@ daemons are required for the core pipeline.
 | Recording | **webrtcvad** + **sounddevice** (PortAudio) | Voice-activity detection trims silence. |
 | Audio cleanup | **RNNoise** (noise suppression) + numpy frequency-domain **AEC** | Denoise the mic; cancel the speaker echo. |
 | Speaker gate | **SpeechBrain** ECAPA-TDNN (PyTorch, CPU) | Cosine-similarity voiceprint match. |
-| Speech-to-text | **faster-whisper** (CTranslate2) | `small` model, CPU, int8. |
+| Speech-to-text | **faster-whisper** (CTranslate2) | `medium` model on GPU (CUDA, fp16); auto-falls back to CPU int8. Parked off-GPU while the vision model runs so both fit in VRAM. |
 | LLM brain | **Qwen3-8B** (Q4_K_M GGUF) via **llama-cpp-python** | In-process, GPU or CPU, streaming. |
 | Text-to-speech | **Piper** (ONNX) | Streamed sentence-by-sentence. |
 
@@ -423,6 +424,37 @@ TAVILY_API_KEY=tvly-...
 variables still work; `.env` values take precedence over stale ones.) When a
 backend returns raw snippets, the LLM condenses them into one spoken sentence;
 if a backend fails, Atlas automatically falls back to the next available one.
+
+### Website login & credential vault
+
+Atlas can store your website logins and sign you in on request (*"log into
+Gmail"*, *"log into Facebook on Brave"*). Passwords are **never** kept in
+plaintext — the vault (`vault.py`) encrypts each secret at rest with **Windows
+DPAPI** (tied to your account, no prompt), plus an **optional master password**
+(AES/Fernet, prompted once per session) for a second layer.
+
+**Save a login** in a terminal (secrets never go through voice/STT):
+
+```bash
+python vault.py --set --site gmail --username you@gmail.com   # prompts for the password (hidden)
+python vault.py --list          # show saved sites
+python vault.py --delete gmail  # remove one
+```
+
+**Then, by voice:** *"log into gmail"*. Atlas opens the site's login page and
+fills your saved credentials, preferring — in order:
+
+1. **CDP / Playwright** — drives the real browser's DOM by selector (fast,
+   reliable). Enable with `pip install playwright` (library only; it attaches to
+   your existing Brave/Chrome — no browser download).
+2. **Vision-guided** — locates the fields on screen with the vision model and
+   clicks/types (handles Google's account chooser + two-step flow).
+3. **Keyboard autofill** — types into the focused login form.
+
+Add *"in &lt;browser&gt;"* (Chrome, Brave, Firefox, Edge) to open/login in a
+specific browser. Config lives in `VaultConfig`; the vault file (`vault.dat`) is
+gitignored and wiped by a factory reset. 2FA / CAPTCHA still need you to finish
+them. Set `enabled = False` to disable the feature.
 
 ### System control
 
@@ -919,7 +951,13 @@ enabled …`. Tune via `DspConfig`: `enable_noise_suppression`,
 removed, since the right value depends on your machine's audio output+input
 latency. AEC is a from-scratch numpy filter (no Windows AEC library builds), so
 treat it as effective-but-tunable; it reaches ~12–16 dB echo reduction on
-synthetic tests.
+synthetic tests. Run **`python calibrate_aec.py`** to measure your machine's
+round-trip latency and pick the best `aec_ref_delay_ms` automatically.
+
+**Barge-in modes** (`Config.bargein_mode`): the default **`speech`** interrupts
+the moment you start talking (near-end energy after AEC — cheap, so it reacts in
+real time, no wake word needed); **`wakeword`** requires you to say "Atlas" but
+its per-chunk model can lag on a busy CPU. On/off is `PlaybackConfig.allow_barge_in`.
 
 ### Text input (press F1)
 
@@ -991,12 +1029,13 @@ Everything tunable lives in `config.py` (dataclasses):
 
 | Dataclass | What it controls |
 | --- | --- |
-| `Config` | Sample rate, VAD/silence timing, wake model + threshold, speaker threshold and `require_speaker_match`, STT model/device/language, follow-up window, `enable_text_input` / `text_input_vk` (F1 typed input), `startup_phrase` (spoken greeting). |
+| `Config` | Sample rate, VAD/silence timing, wake model + `wake_threshold` + `wake_min_rms` (room-noise gate) + `wake_consecutive`, barge-in (`bargein_mode` speech/wakeword, `bargein_speech_rms`), `min_command_ms` (minimum listen after speech starts), speaker threshold and `require_speaker_match`, STT model/device/language, follow-up window, `enable_text_input` / `text_input_vk` (F1 typed input), `startup_phrase` (spoken greeting). |
 | `LLMConfig` | Model path, `n_gpu_layers`, context size, system prompt, `disable_thinking` (Qwen3 `/no_think`), `enable_tools`, `max_tool_rounds`. |
 | `TTSConfig` | Piper voice paths, output sample rate, `default_lang`, `voices` map. |
 | `PlaybackConfig` | `allow_barge_in`. |
 | `DspConfig` | `enable_noise_suppression` (RNNoise), `enable_echo_cancellation`, `aec_filter_blocks`, `aec_mu`, `aec_ref_delay_ms`. |
 | `ToolsConfig` | `web_search_backend`, Tavily credentials, `enable_system_control`, `allow_power_off`, `enable_coding`, `command_timeout`, `enable_self_extend`, `plugins_dir`. |
+| `VaultConfig` | Encrypted website-login vault (`vault.py`): `enabled`, `vault_path`, `use_dpapi`, `master_password`, `use_cdp_login` (Playwright DOM fill), `autofill_delay`. |
 | `CodeAgentConfig` | `enable_code_agent`, `crew_venv`, `runner`, `timeout`, `output_dir`, `agent_role`/`agent_goal`/`agent_backstory`, `model` (`ATLAS_CREW_MODEL`, Gemini). |
 | `AgentsConfig` | `enable_agents`, `max_iterations`, `confirm_risky`, `risky_tools`, the ReAct system prompt. |
 | `MemoryConfig` | `enable_memory`, `recall_k`, `score_threshold`, store path. |
@@ -1043,9 +1082,18 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
 - **"No voiceprint found"** — run `python enroll.py`.
 - **"GGUF not found"** — download the model to `models/Qwen3-8B-Q4_K_M.gguf`.
 - **"Could not open the microphone"** — check your input device / OS permissions.
-- **Wake word too sensitive / not triggering** — adjust `wake_threshold`.
-- **Cuts you off / won't stop recording** — tune `silence_tail_ms` /
-  `vad_aggressiveness`.
+- **Wake word "wakes on every word" from idle** — usually your room's background
+  noise is clearing the energy gate, so the decay-tail after any word triggers it.
+  Raise **`wake_min_rms`** above your room's noise floor (measure it with
+  `wake_pytorch/live_mic_test.py`); raise `wake_threshold` / `wake_consecutive` too
+  if needed.
+- **Wake word only responds to *your* voice** — the model was trained too heavily
+  on your own recordings. Retrain speaker-independent: keep the diverse TTS
+  positives and use a low `--real-frac` (≈0.1), not 0.5.
+- **Wake word not triggering** — lower `wake_threshold`, or `wake_min_rms` if a
+  soft/distant "Atlas" is missed.
+- **Cuts you off / won't stop recording** — tune `silence_tail_ms`,
+  `min_command_ms` (minimum listen time), and `vad_aggressiveness`.
 - **GPU build loads as CPU** — rerun `python setup_gpu.py`; confirm
   `llama_supports_gpu_offload()` is `True`.
 - **Memory/State/Cache disabled** — read the `DISABLED — <reason>` line; for
@@ -1069,6 +1117,8 @@ Secrets (`ATLAS_TAVILY_MCP_URL` / `TAVILY_API_KEY`, `ATLAS_PG_DSN`,
 | `llm.py` | Qwen3 brain, tool loop, context building. |
 | `agents.py` | ReAct task agent + risk confirmation. |
 | `tools.py` | Tool registry + JSON protocol + self-extension (plugins). |
+| `vault.py` | Encrypted website-login vault (DPAPI/AES) + `--set`/`--list` CLI. |
+| `calibrate_aec.py` | Measures audio round-trip latency to tune `aec_ref_delay_ms`. |
 | `code_agent.py` / `crew_runner.py` / `setup_crew.py` | CrewAI coding agent: subprocess bridge + isolated-venv runner + setup. |
 | `plugins/` | Custom tools Atlas wrote for itself (auto-loaded at startup). |
 | `system_control.py` | OS actions (volume, media, apps, input, power). |
