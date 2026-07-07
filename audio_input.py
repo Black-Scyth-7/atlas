@@ -106,6 +106,9 @@ def record_until_silence(stream: MicLike, vad: webrtcvad.Vad,
     spoke_at_all = False
     silence_limit = cfg.silence_tail_ms // cfg.frame_ms
     max_frames = cfg.max_command_ms // cfg.frame_ms
+    # Keep recording at least this many frames after speech starts, so a mid-
+    # command pause can't end the capture early (see Config.min_command_ms).
+    min_frames = getattr(cfg, "min_command_ms", 0) // cfg.frame_ms
     start_limit = (start_timeout_ms // cfg.frame_ms) if start_timeout_ms else None
 
     for i in range(max_frames):
@@ -126,7 +129,7 @@ def record_until_silence(stream: MicLike, vad: webrtcvad.Vad,
         else:
             recorded.append(pcm)
             silence_run = 0 if is_speech else silence_run + 1
-            if silence_run >= silence_limit:
+            if silence_run >= silence_limit and len(recorded) >= min_frames:
                 break
 
     if not spoke_at_all:

@@ -37,7 +37,7 @@ class Config:
     # hardest sound-alike in your own speech peaks ~0.63, so this cleanly rejects
     # your chatter with zero recall cost. Lower toward 0.5 if a quiet/far "Atlas"
     # ever gets missed on a live mic; raise to reduce false triggers further.
-    wake_threshold: float = 0.95
+    wake_threshold: float = 0.75
     # Speech-energy gate (frame RMS, 0..1): the detector ignores frames quieter
     # than this so a wake can only fire on an audible burst. The MatchboxNet
     # scores the QUIET DECAY TAIL of any preceding sound very high (a word ends,
@@ -48,7 +48,14 @@ class Config:
     # 0.015 blocks every one while real spoken "Atlas" fires at rms 0.05-0.36).
     # Set 0.0 to disable (raw model). Raise if faint room noise still triggers;
     # lower toward 0.01 if a soft/distant "Atlas" is ever missed.
-    wake_min_rms: float = 0.015
+    # NOTE: this gate must sit ABOVE your room's background-noise RMS. 0.015 was
+    # tuned for a quiet room; in a noisier room the decay-tail after ANY word
+    # clears the gate and false-wakes ("wakes on every word from idle" — verified:
+    # noise at rms 0.03 fired 6/60 clips at gate 0.015, but 0 at gate 0.05).
+    # 0.025 gives some noise margin while keeping recall; RAISE toward 0.04-0.05
+    # if it still false-wakes from idle, LOWER toward 0.015 if a normal "Atlas"
+    # gets missed. Measure your room's floor with wake_pytorch/live_mic_test.py.
+    wake_min_rms: float = 0.025
     # The detector's rolling window fills over the first ~1.5 s after a reset, so
     # early scores see mostly zero-padded audio; ignore detections during this
     # warm-up of 80 ms chunks so Atlas doesn't wake itself at startup.
@@ -86,6 +93,10 @@ class Config:
 
     # --- Recording / voice activity detection (webrtcvad) ---
     silence_tail_ms: int = 800      # stop after this much trailing silence
+    # Minimum time to keep recording AFTER speech starts, even if you pause — so a
+    # short gap mid-command doesn't cut you off early. The silence-tail stop only
+    # takes effect once at least this much has been recorded. 0 disables.
+    min_command_ms: int = 3000
     max_command_ms: int = 12000     # hard cap on a single command
     vad_aggressiveness: int = 2     # 0 (lenient) .. 3 (aggressive)
     preroll_frames: int = 5         # ~150 ms of lead-in kept before speech starts
